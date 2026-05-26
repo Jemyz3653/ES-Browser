@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-PyBrowser v3
+ES-Browser v4
 Install: pip install PyQt5 PyQtWebEngine
-Run:     python pybrowser.py
+Run:     python ES-Browser.py
 """
 
 import sys, os, re, json, fnmatch
@@ -22,7 +22,7 @@ from PyQt5.QtWebEngineWidgets import (
     QWebEngineView, QWebEngineProfile, QWebEnginePage,
     QWebEngineSettings, QWebEngineScript,
 )
-from PyQt5.QtCore import Qt, QUrl, QSize, QRect, pyqtSignal, QTimer, QPoint
+from PyQt5.QtCore import Qt, QUrl, QSize, QRect, pyqtSignal, QTimer, QPoint, QEvent, QObject
 from PyQt5.QtGui import (
     QIcon, QKeySequence, QColor, QPalette, QPixmap, QPainter, QFont,
     QFontMetrics,
@@ -41,6 +41,60 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 RUFFLE_CDN = "https://unpkg.com/@ruffle-rs/ruffle"
 
+# Chrome 120 UA — без него YouTube / Google видят «неизвестный браузер» и режут JS
+CHROME_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
+
+# JS для защиты от утечки реального IP через WebRTC
+WEBRTC_PROTECTION_JS = """
+(function(){
+  // Whitelist: X.com/Twitter детектирует любые изменения RTCPeerConnection
+  var h=location.hostname;
+  if(h==='x.com'||h==='twitter.com'||h.endsWith('.x.com')||h.endsWith('.twitter.com'))return;
+
+  if(typeof RTCPeerConnection==='undefined')return;
+  var _orig=RTCPeerConnection;
+
+  function _patch(cfg){
+    if(!cfg)return{};
+    var c=Object.assign({},cfg);
+    if(c.iceServers){
+      var t=c.iceServers.filter(function(s){
+        return [].concat(s.urls||[]).some(function(u){return u&&u.indexOf('turn:')===0;});
+      });
+      c.iceServers=t;
+    }
+    return c;
+  }
+
+  try{
+    var _p=new Proxy(_orig,{
+      construct:function(T,a){return Reflect.construct(T,[_patch(a[0])].concat(Array.from(a).slice(1)));},
+      get:function(T,k,R){
+        if(k==='toString')return function(){return 'function RTCPeerConnection() { [native code] }';};
+        if(k==='name')return 'RTCPeerConnection';
+        return Reflect.get(T,k,R);
+      }
+    });
+    Object.defineProperty(window,'RTCPeerConnection',{value:_p,writable:true,configurable:true,enumerable:false});
+    if(window.webkitRTCPeerConnection)Object.defineProperty(window,'webkitRTCPeerConnection',{value:_p,writable:true,configurable:true,enumerable:false});
+  }catch(e){}
+})();
+"""
+
+# Паттерны опасных URL для Safe Browsing (базовый список)
+SAFE_BROWSING_PATTERNS = [
+    r"(?:password|passwd|credential|login)[_-]?(?:stealer|dump|hack)",
+    r"(?:free[_-]?(?:v[_-]?bucks?|robux|gems?|coins?)|gift[_-]?card[_-]?gen)",
+    r"(?:ransomware|cryptolocker|wannacry|petya)",
+    r"(?:phish(?:ing)?|pharming)[_-]?(?:kit|page|site)",
+    r"(?:\.(?:tk|ml|ga|cf|gq|pw|top|click|download))/.*(?:login|signin|account|verify|secure|update|password)",
+    r"(?:bit\.ly|tinyurl\.com|goo\.gl|t\.co)/[a-zA-Z0-9]{4,8}$",  # подозрительные сокращения без пути
+]
+
 DEFAULTS = {
     "homepage":          "about:newtab",
     "search_engine":     "https://www.google.com/search?q=",
@@ -52,7 +106,312 @@ DEFAULTS = {
     "dark_reader":       False,
     "user_agent":        "",
     "restore_session":   False,
+    "downloads_dir":     DOWNLOADS_DIR,
+    "javascript":        True,
+    "block_popups":      True,
+    "lang":              "en_US",
+    # ── Безопасность ──────────────────────────────────────────────────────────
+    "block_mixed_content":       True,   # HTTP-ресурсы на HTTPS-странице → заблокировать
+    "webrtc_protection":         True,   # Предотвратить утечку IP через WebRTC
+    "dnt":                       True,   # Заголовок Do Not Track
+    "referrer_policy":           "strict-origin",  # full / strict-origin / no-referrer
+    "safe_browsing":             True,   # Блокировать подозрительные URL
+    "permission_camera":         "ask",  # ask / deny / allow
+    "permission_mic":            "ask",
+    "permission_location":       "deny",
+    "permission_notifications":  "ask",
 }
+
+# ── i18n ───────────────────────────────────────────────────────────────────────
+STRINGS = {
+    "en_US": {
+        # Menus
+        "menu_file": "File", "menu_new_tab": "New Tab",
+        "menu_new_priv_tab": "New Private Tab",
+        "menu_new_priv_win": "New Private Window",
+        "menu_close_tab": "Close Tab",
+        "menu_reopen_tab": "Reopen Closed Tab",
+        "menu_save_page": "Save Page", "menu_screenshot": "Screenshot",
+        "menu_print": "Print", "menu_quit": "Quit",
+        "menu_edit": "Edit", "menu_find": "Find in Page",
+        "menu_select_all": "Select All", "menu_copy": "Copy",
+        "menu_view": "View", "menu_zoom_in": "Zoom In",
+        "menu_zoom_out": "Zoom Out", "menu_zoom_reset": "Reset Zoom",
+        "menu_fullscreen": "Full Screen",
+        "menu_bm_sidebar": "Bookmarks Sidebar",
+        "menu_reader": "Reader Mode", "menu_translate": "Translate Page",
+        "menu_dark_mode": "Site Dark Mode (Dark Reader)",
+        "menu_history": "History", "menu_show_history": "Show History",
+        "menu_clear_data": "Clear Browsing Data",
+        "menu_save_session": "Save Session",
+        "menu_restore_session": "Restore Session",
+        "menu_bookmarks": "Bookmarks",
+        "menu_bm_page": "Bookmark This Page",
+        "menu_flash": "Flash",
+        "menu_ruffle": "Enable Ruffle Flash emulation",
+        "menu_open_swf": "Open SWF File…",
+        "menu_tools": "Tools", "menu_downloads": "Downloads",
+        "menu_extensions": "Extensions", "menu_themes": "Themes",
+        "menu_user_scripts": "User Scripts",
+        "menu_tab_search": "Tab Search", "menu_settings": "Settings",
+        "menu_devtools": "Developer Tools",
+        "menu_view_source": "View Page Source",
+        "menu_page_info": "Page Info",
+        "menu_help": "Help", "menu_about": "About ES-Browser",
+        # Toolbar
+        "tip_back": "Back  Alt+←", "tip_forward": "Forward  Alt+→",
+        "tip_home": "Home",
+        "url_ph": "Search or enter URL…",
+        "tip_bookmark": "Bookmark  Ctrl+D",
+        "tip_dark": "Toggle site dark mode",
+        "tip_new_tab": "New tab  Ctrl+T",
+        # Tabs
+        "tab_new": "New Tab", "tab_private": "\U0001f575 Private",
+        # Status bar
+        "st_bookmarked": "Bookmarked: {0}",
+        "st_bm_removed": "Bookmark removed",
+        "st_dark_on": "Site dark mode ON — reload pages",
+        "st_dark_off": "Site dark mode OFF",
+        "st_settings_saved": "Settings saved",
+        "st_data_cleared": "Browsing data cleared",
+        "st_session_saved": "Session saved ({0} tabs)",
+        # Settings dialog
+        "set_title": "Settings",
+        "set_sec_general": "General", "set_sec_content": "Content",
+        "set_sec_advanced": "Advanced",
+        "set_homepage": "Homepage:", "set_hp_newtab": "New Tab (built-in)",
+        "set_hp_custom": "Custom URL:", "set_engine": "Search engine:",
+        "set_zoom": "Default zoom:", "set_restore": "Restore last session on startup",
+        "set_dl_folder": "Downloads folder:", "set_lang": "Language:",
+        "set_js": "Enable JavaScript",
+        "set_popups": "Block pop-up windows",
+        "set_dark": "Dark Reader  (site-wide dark mode)",
+        "set_ua": "User-Agent override:",
+        "set_ua_ph": "Leave empty for Chrome 120 default",
+        "set_lang_restart": "Language change will take effect after restarting ES-Browser.",
+        # Private window bar
+        "priv_bar": "<b>Private Browsing</b> — history and cookies won’t be saved",
+        # Dialogs common
+        "dlg_ok": "OK", "dlg_cancel": "Cancel", "dlg_close": "Close",
+        "dlg_open": "Open", "dlg_delete": "Delete",
+        "dlg_clear_done": "Clear completed", "dlg_clear_all": "Clear all",
+        "dlg_new": "New", "dlg_save": "Save",
+        # History
+        "hist_title": "History", "hist_search_ph": "Search history…",
+        # Downloads
+        "dl_title": "Downloads",
+        # Clear data
+        "clr_title": "Clear Browsing Data",
+        "clr_history": "Browsing history",
+        "clr_cache": "Cache (clears Chromium cache)",
+        "clr_cookies": "Cookies and site data",
+        # Page info
+        "pi_title": "Page Info",
+        "pi_secure": "\U0001f512 Secure (HTTPS)",
+        "pi_insecure": "⚠ Not secure (HTTP)",
+        # Sessions
+        "sess_title": "Restore Session", "sess_choose": "Choose session:",
+        "sess_none": "No saved sessions found.",
+        # Find bar
+        "find_label": "  Find:", "find_ph": "Find in page…",
+        "find_not_found": "Not found", "find_case": "Case sensitive",
+        # Bookmarks sidebar
+        "bm_title": "Bookmarks",
+        # History confirm
+        "hist_confirm_title": "Clear History", "hist_confirm_msg": "Delete all history?",
+        # User Scripts
+        "us_title": "User Scripts",
+        "us_hint": "Injected on pages matching the URL pattern (glob, e.g. *google.com*)",
+        "us_manage": "⚙️  Manage User Scripts (Tampermonkey)",
+        "us_form_name": "Name:", "us_form_pattern": "URL pattern:", "us_form_code": "Code:",
+        # Extensions / Themes
+        "ext_title": "Extensions",
+        "themes_title": "Themes", "themes_choose": "Choose a Theme",
+        # Tab search
+        "tab_search_ph": "Search open tabs…",
+        # Window titles
+        "priv_win_title": "Private Browsing — ES-Browser",
+        "devtools_title": "Developer Tools", "pagesrc_title": "Page Source",
+        # Security settings
+        "set_sec_security": "Security",
+        "set_mixed":   "Block mixed content (HTTP resources on HTTPS pages)",
+        "set_webrtc":  "WebRTC IP leak protection",
+        "set_dnt":     "Send Do Not Track (DNT) header",
+        "set_referrer": "Referrer policy:",
+        "set_safe_browsing": "Safe browsing (block dangerous URLs)",
+        "set_cam":     "Camera:", "set_mic": "Microphone:",
+        "set_loc":     "Location:", "set_notif": "Notifications:",
+        "perm_ask": "Ask", "perm_deny": "Deny", "perm_allow": "Allow",
+        "ref_full":   "Full URL",
+        "ref_origin": "Origin only (recommended)",
+        "ref_none":   "No referrer",
+        "sb_title": "Dangerous Site Warning",
+        "sb_msg": "The site {0} matches a known dangerous pattern.\n\nProceed anyway?",
+        "perm_cam": "Camera", "perm_mic": "Microphone",
+        "perm_cam_mic": "Camera + Microphone",
+        "perm_geo": "Location", "perm_notif": "Notifications",
+        "perm_ask_title": "Permission Request",
+        "perm_ask_msg": "{0} wants access to {1}.\n\nAllow?",
+        # New tab
+        "newtab_go": "Go",
+        "newtab_ph": "Search or enter URL…",
+        "newtab_hint": "Ctrl+T new tab • Ctrl+L address bar • F12 devtools • Ctrl+Shift+N private window",
+    },
+    "ru_RU": {
+        # Меню
+        "menu_file": "Файл", "menu_new_tab": "Новая вкладка",
+        "menu_new_priv_tab": "Новая приватная вкладка",
+        "menu_new_priv_win": "Новое приватное окно",
+        "menu_close_tab": "Закрыть вкладку",
+        "menu_reopen_tab": "Открыть закрытую вкладку",
+        "menu_save_page": "Сохранить страницу",
+        "menu_screenshot": "Скриншот",
+        "menu_print": "Печать", "menu_quit": "Выход",
+        "menu_edit": "Правка", "menu_find": "Поиск по странице",
+        "menu_select_all": "Выделить всё", "menu_copy": "Копировать",
+        "menu_view": "Вид", "menu_zoom_in": "Увеличить масштаб",
+        "menu_zoom_out": "Уменьшить масштаб",
+        "menu_zoom_reset": "Сбросить масштаб",
+        "menu_fullscreen": "Полный экран",
+        "menu_bm_sidebar": "Панель закладок",
+        "menu_reader": "Режим чтения",
+        "menu_translate": "Перевести страницу",
+        "menu_dark_mode": "Тёмный режим сайтов (Dark Reader)",
+        "menu_history": "Журнал",
+        "menu_show_history": "Показать журнал",
+        "menu_clear_data": "Очистить данные браузера",
+        "menu_save_session": "Сохранить сессию",
+        "menu_restore_session": "Восстановить сессию",
+        "menu_bookmarks": "Закладки",
+        "menu_bm_page": "Добавить страницу в закладки",
+        "menu_flash": "Flash",
+        "menu_ruffle": "Включить эмуляцию Ruffle Flash",
+        "menu_open_swf": "Открыть SWF файл…",
+        "menu_tools": "Инструменты",
+        "menu_downloads": "Загрузки",
+        "menu_extensions": "Расширения", "menu_themes": "Темы",
+        "menu_user_scripts": "Пользовательские скрипты",
+        "menu_tab_search": "Поиск по вкладкам",
+        "menu_settings": "Настройки",
+        "menu_devtools": "Инструменты разработчика",
+        "menu_view_source": "Исходный код страницы",
+        "menu_page_info": "Информация о странице",
+        "menu_help": "Справка", "menu_about": "О ES-Browser",
+        # Панель инструментов
+        "tip_back": "Назад  Alt+←",
+        "tip_forward": "Вперёд  Alt+→",
+        "tip_home": "Домой",
+        "url_ph": "Поиск или адрес сайта…",
+        "tip_bookmark": "Закладка  Ctrl+D",
+        "tip_dark": "Тёмный режим сайта",
+        "tip_new_tab": "Новая вкладка  Ctrl+T",
+        # Вкладки
+        "tab_new": "Новая вкладка", "tab_private": "\U0001f575 Приватная",
+        # Статусная строка
+        "st_bookmarked": "Добавлено в закладки: {0}",
+        "st_bm_removed": "Закладка удалена",
+        "st_dark_on": "Тёмный режим ВКЛЮЧЁН — перезагрузите страницы",
+        "st_dark_off": "Тёмный режим ВЫКЛЮЧЕН",
+        "st_settings_saved": "Настройки сохранены",
+        "st_data_cleared": "Данные браузера очищены",
+        "st_session_saved": "Сессия сохранена ({0} вкладок)",
+        # Диалог настроек
+        "set_title": "Настройки",
+        "set_sec_general": "Основные", "set_sec_content": "Контент",
+        "set_sec_advanced": "Дополнительно",
+        "set_homepage": "Домашняя страница:", "set_hp_newtab": "Новая вкладка (встроенная)",
+        "set_hp_custom": "Мой сайт (URL):",
+        "set_engine": "Поисковик:",
+        "set_zoom": "Масштаб по умолчанию:",
+        "set_restore": "Восстанавливать последнюю сессию при запуске",
+        "set_dl_folder": "Папка загрузок:",
+        "set_lang": "Язык:",
+        "set_js": "Включить JavaScript",
+        "set_popups": "Блокировать всплывающие окна",
+        "set_dark": "Dark Reader  (тёмный режим сайтов)",
+        "set_ua": "Свой User-Agent:",
+        "set_ua_ph": "Оставьте пустым для Chrome 120",
+        "set_lang_restart": "Смена языка применится после перезапуска ES-Browser.",
+        # Приватный режим
+        "priv_bar": "<b>Приватный режим</b> — история и куки не сохраняются",
+        # Общие кнопки
+        "dlg_ok": "ОК", "dlg_cancel": "Отмена", "dlg_close": "Закрыть",
+        "dlg_open": "Открыть", "dlg_delete": "Удалить",
+        "dlg_clear_done": "Удалить завершённые",
+        "dlg_clear_all": "Очистить всё",
+        "dlg_new": "Новый", "dlg_save": "Сохранить",
+        # История
+        "hist_title": "Журнал", "hist_search_ph": "Поиск в журнале…",
+        # Загрузки
+        "dl_title": "Загрузки",
+        # Очистка данных
+        "clr_title": "Очистить данные браузера",
+        "clr_history": "История посещений",
+        "clr_cache": "Кэш (очищает кэш Chromium)",
+        "clr_cookies": "Куки и данные сайтов",
+        # Информация о странице
+        "pi_title": "Информация о странице",
+        "pi_secure": "\U0001f512 Защищённое (HTTPS)",
+        "pi_insecure": "⚠ Незащищённое (HTTP)",
+        # Сессии
+        "sess_title": "Восстановить сессию",
+        "sess_choose": "Выберите сессию:",
+        "sess_none": "Сохранённых сессий не найдено.",
+        # Строка поиска
+        "find_label": "  Найти:", "find_ph": "Поиск по странице…",
+        "find_not_found": "Не найдено", "find_case": "С учётом регистра",
+        # Закладки
+        "bm_title": "Закладки",
+        # История
+        "hist_confirm_title": "Очистить журнал", "hist_confirm_msg": "Удалить всю историю?",
+        # Пользовательские скрипты
+        "us_title": "Пользовательские скрипты",
+        "us_hint": "Вставляется на страницах по шаблону URL (glob, напр. *google.com*)",
+        "us_manage": "⚙️  Управление скриптами (Tampermonkey)",
+        "us_form_name": "Имя:", "us_form_pattern": "URL шаблон:", "us_form_code": "Код:",
+        # Расширения / Темы
+        "ext_title": "Расширения",
+        "themes_title": "Темы", "themes_choose": "Выбор темы",
+        # Поиск вкладок
+        "tab_search_ph": "Поиск по вкладкам…",
+        # Заголовки окон
+        "priv_win_title": "Приватный режим — ES-Browser",
+        "devtools_title": "Инструменты разработчика", "pagesrc_title": "Исходный код",
+        # Настройки безопасности
+        "set_sec_security": "Безопасность",
+        "set_mixed":   "Блокировать смешанный контент (HTTP на HTTPS-страницах)",
+        "set_webrtc":  "Защита от утечки IP через WebRTC",
+        "set_dnt":     "Отправлять заголовок Do Not Track (DNT)",
+        "set_referrer": "Политика Referer:",
+        "set_safe_browsing": "Безопасный просмотр (блокировать опасные URL)",
+        "set_cam":     "Камера:", "set_mic": "Микрофон:",
+        "set_loc":     "Геолокация:", "set_notif": "Уведомления:",
+        "perm_ask": "Спрашивать", "perm_deny": "Запрещать", "perm_allow": "Разрешать",
+        "ref_full":   "Полный URL",
+        "ref_origin": "Только домен (рекомендуется)",
+        "ref_none":   "Не отправлять",
+        "sb_title": "Предупреждение об опасном сайте",
+        "sb_msg": "Сайт {0} соответствует паттерну опасного ресурса.\n\nВсё равно перейти?",
+        "perm_cam": "Камера", "perm_mic": "Микрофон",
+        "perm_cam_mic": "Камера + Микрофон",
+        "perm_geo": "Геолокация", "perm_notif": "Уведомления",
+        "perm_ask_title": "Запрос разрешения",
+        "perm_ask_msg": "{0} запрашивает доступ к {1}.\n\nРазрешить?",
+        # Новая вкладка
+        "newtab_go": "Вперёд",
+        "newtab_ph": "Поиск или адрес сайта…",
+        "newtab_hint": "Ctrl+T новая вкладка • Ctrl+L адресная строка • F12 devtools • Ctrl+Shift+N приватное окно",
+    },
+}
+
+_current_lang = "en_US"
+
+def tr(key: str, *args) -> str:
+    """Вернуть переведённую строку по ключу."""
+    lang = STRINGS.get(_current_lang, STRINGS["en_US"])
+    text = lang.get(key) or STRINGS["en_US"].get(key, key)
+    return text.format(*args) if args else text
+
 SEARCH_ENGINES = {
     "Google":     "https://www.google.com/search?q=",
     "DuckDuckGo": "https://duckduckgo.com/?q=",
@@ -68,7 +427,7 @@ AD_DOMAINS = {
     "adnxs.com","advertising.com","outbrain.com","taboola.com",
     "scorecardresearch.com","quantserve.com","amazon-adsystem.com",
     "moatads.com","mc.yandex.ru","counter.yadro.ru","pagead2.googlesyndication.com",
-    "ads.twitter.com","pixel.facebook.com","pixel.advertising.com",
+    "pixel.facebook.com","pixel.advertising.com",
     "analytics.google.com","stats.g.doubleclick.net","adservice.google.com",
     "adbrite.com","zedo.com","yieldmanager.com","adroll.com","criteo.com",
     "pubmatic.com","openx.net","rubiconproject.com","spotxchange.com",
@@ -188,6 +547,154 @@ PALETTES = {
 
 THEME_NAMES = list(PALETTES.keys())
 
+# ── Chrome spoof — инжектируется на DocumentCreation, до любых скриптов страницы
+# Без этого Google/YouTube видят QtWebEngine и блокируют вход
+CHROME_SPOOF_JS = r"""
+(function() {
+'use strict';
+
+function def(obj, prop, value) {
+  try {
+    Object.defineProperty(obj, prop, {
+      get: function() { return value; },
+      configurable: true, enumerable: true
+    });
+  } catch(e) { try { obj[prop] = value; } catch(e2) {} }
+}
+
+/* 1. navigator.webdriver */
+def(navigator, 'webdriver', undefined);
+
+/* 2. navigator.vendor */
+def(navigator, 'vendor', 'Google Inc.');
+
+/* 3. navigator.languages */
+def(navigator, 'languages', ['ru-RU', 'ru', 'en-US', 'en']);
+
+/* 4. navigator.plugins */
+function makePlugin(name, desc, filename, mts) {
+  var p = { name: name, description: desc, filename: filename, length: mts.length };
+  mts.forEach(function(m, i) { p[i] = m; });
+  return p;
+}
+var fakePlugins = [
+  makePlugin('Chrome PDF Plugin',   'Portable Document Format', 'internal-pdf-viewer',
+    [{ type: 'application/x-google-chrome-pdf', suffixes: 'pdf', description: 'Portable Document Format' }]),
+  makePlugin('Chrome PDF Viewer',   '', 'mhjfbmdgcfjbbpaeojofohoefgiehjai', []),
+  makePlugin('Native Client',       '', 'internal-nacl-plugin',
+    [{ type: 'application/x-nacl',  suffixes: '', description: 'Native Client Executable' },
+     { type: 'application/x-pnacl', suffixes: '', description: 'Portable Native Client Executable' }]),
+  makePlugin('WebKit built-in PDF', '', 'WebKit built-in PDF', []),
+  makePlugin('Widevine Content Decryption Module',
+    'Enables Widevine licenses for playback of HTML audio/video content.',
+    'widevinecdmadapter.dll',
+    [{ type: 'application/x-ppapi-widevine-cdm', suffixes: '', description: '' }]),
+];
+def(navigator, 'plugins', fakePlugins);
+
+/* 5. navigator.userAgentData (Client Hints) */
+var _brands = [
+  { brand: 'Not_A Brand',    version: '8'   },
+  { brand: 'Chromium',       version: '120' },
+  { brand: 'Google Chrome',  version: '120' }
+];
+var _uaData = {
+  brands:   _brands,
+  mobile:   false,
+  platform: 'Windows',
+  getHighEntropyValues: function(hints) {
+    return Promise.resolve({
+      architecture: 'x86', bitness: '64',
+      brands: _brands,
+      fullVersionList: [
+        { brand: 'Not_A Brand',   version: '8.0.0.0'      },
+        { brand: 'Chromium',      version: '120.0.6099.71' },
+        { brand: 'Google Chrome', version: '120.0.6099.71' }
+      ],
+      mobile: false, model: '', platform: 'Windows',
+      platformVersion: '15.0.0', uaFullVersion: '120.0.6099.71', wow64: false
+    });
+  },
+  toJSON: function() {
+    return { brands: _brands, mobile: false, platform: 'Windows' };
+  }
+};
+def(navigator, 'userAgentData', _uaData);
+
+/* 6. Permissions API — не трогаем нативный объект (детектируется X.com) */
+
+/* 7. window.chrome (через defineProperty — перезаписывает QtWebEngine) */
+var _chr = {
+  app: {
+    isInstalled: false,
+    getDetails:     function() { return null; },
+    getIsInstalled: function() { return false; },
+    installState:   function(cb) { if (cb) cb('not_installed'); },
+    runningState:   function() { return 'cannot_run'; }
+  },
+  runtime: {
+    id: undefined, lastError: null,
+    connect: function() {
+      return {
+        postMessage: function() {}, disconnect: function() {}, name: '', sender: null,
+        onMessage:    { addListener: function() {}, removeListener: function() {}, hasListener: function() { return false; } },
+        onDisconnect: { addListener: function() {}, removeListener: function() {}, hasListener: function() { return false; } }
+      };
+    },
+    sendMessage:        function() {},
+    getManifest:        function() { return {}; },
+    getURL:             function(p) { return p || ''; },
+    reload:             function() {},
+    requestUpdateCheck: function(cb) { if (cb) cb('no_update'); },
+    getPlatformInfo:    function(cb) {
+      var i = { os: 'win', arch: 'x86-64', nacl_arch: 'x86-64' };
+      if (cb) cb(i); else return Promise.resolve(i);
+    },
+    openOptionsPage:    function() {},
+    setUninstallURL:    function() {},
+    onInstalled:        { addListener: function() {}, removeListener: function() {}, hasListener: function() { return false; } },
+    onStartup:          { addListener: function() {}, removeListener: function() {}, hasListener: function() { return false; } },
+    onMessage:          { addListener: function() {}, removeListener: function() {}, hasListener: function() { return false; } },
+    onConnect:          { addListener: function() {}, removeListener: function() {}, hasListener: function() { return false; } },
+    onSuspend:          { addListener: function() {}, removeListener: function() {}, hasListener: function() { return false; } },
+    onUpdateAvailable:  { addListener: function() {}, removeListener: function() {}, hasListener: function() { return false; } }
+  },
+  webstore: {
+    install: function() {},
+    onInstallStageChanged: { addListener: function() {} },
+    onDownloadProgress:    { addListener: function() {} }
+  },
+  csi: function() {
+    return {
+      startE: performance.timing ? performance.timing.navigationStart : Date.now(),
+      onloadT: Date.now(), pageT: performance.now(), tran: 15
+    };
+  },
+  loadTimes: function() {
+    return {
+      requestTime:      performance.timeOrigin / 1000,
+      startLoadTime:    performance.timeOrigin / 1000,
+      commitLoadTime:   (performance.timeOrigin + 50) / 1000,
+      finishDocumentLoadTime: 0, finishLoadTime: 0,
+      firstPaintTime: 0, firstPaintAfterLoadTime: 0,
+      navigationType: 'Other',
+      wasFetchedViaSpdy: true, wasNpnNegotiated: true,
+      npnNegotiatedProtocol: 'h2',
+      wasAlternateProtocolAvailable: false, connectionInfo: 'h2'
+    };
+  }
+};
+try {
+  Object.defineProperty(window, 'chrome', {
+    value: _chr, writable: true, configurable: true, enumerable: true
+  });
+} catch(e) {
+  try { window.chrome = _chr; } catch(e2) {}
+}
+
+})();
+"""
+
 # ── Extension scripts ──────────────────────────────────────────────────────────
 DARK_READER_JS = r"""
 (function(){
@@ -223,7 +730,8 @@ SPEED_DIAL = [
     ("X / Twitter","x.com"),
 ]
 
-def build_newtab_html(dial=None, theme_name="Catppuccin Mocha") -> str:
+def build_newtab_html(dial=None, theme_name="Catppuccin Mocha",
+                      search_engine="https://www.google.com/search?q=") -> str:
     p = PALETTES.get(theme_name, PALETTES["Catppuccin Mocha"])
     if dial is None:
         dial = SPEED_DIAL
@@ -289,8 +797,8 @@ body{{font-family:'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var
 function go(e){{
   e.preventDefault();
   var v=document.getElementById('q').value.trim();if(!v)return;
-  var re=/^(https?:\/\/|[a-zA-Z0-9]([a-zA-Z0-9\-]*\\.)+[a-zA-Z]{{2,}})/;
-  window.location.href=re.test(v)?(v.startsWith('http')?v:'https://'+v):'https://www.google.com/search?q='+encodeURIComponent(v);
+  var re=/^(https?:\\/\\/|[a-zA-Z0-9]([a-zA-Z0-9-]*[.])+[a-zA-Z]{{2,}})/;
+  window.location.href=re.test(v)?(v.startsWith('http')?v:'https://'+v):'{search_engine}'+encodeURIComponent(v);
 }}
 </script></body></html>"""
 
@@ -322,8 +830,11 @@ def load_json(path, default):
         return default
 
 def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"[ES-Browser] save_json error: {e}", file=sys.stderr)
 
 def resolve_url(text: str, search_engine: str) -> str:
     t = text.strip()
@@ -359,10 +870,14 @@ try:
             super().__init__()
             self.ad_block         = True
             self.https_everywhere = False
+            self.dnt              = True
+            self.referrer_policy  = "strict-origin"   # full / strict-origin / no-referrer
             self.domains          = set(AD_DOMAINS)
 
         def interceptRequest(self, info):
             url = info.requestUrl()
+            first = info.firstPartyUrl()
+
             # HTTPS Everywhere
             if self.https_everywhere and url.scheme() == "http":
                 upgraded = QUrl(url); upgraded.setScheme("https")
@@ -371,6 +886,7 @@ try:
                 except Exception:
                     pass
                 return
+
             # Ad block
             if self.ad_block:
                 host = url.host()
@@ -378,6 +894,22 @@ try:
                     if host == d or host.endswith("." + d):
                         info.block(True)
                         return
+
+            # Do Not Track (DNT)
+            # Sec-GPC убран — X.com детектирует его как privacy extension
+            if self.dnt:
+                info.setHttpHeader(b"DNT", b"1")
+
+            # Referrer policy
+            try:
+                if self.referrer_policy == "no-referrer":
+                    info.setHttpHeader(b"Referer", b"")
+                elif self.referrer_policy == "strict-origin":
+                    if first.isValid() and url.host() != first.host():
+                        origin = (first.scheme() + "://" + first.host()).encode()
+                        info.setHttpHeader(b"Referer", origin)
+            except Exception:
+                pass
 
     _has_interceptor = True
 except ImportError:
@@ -410,24 +942,27 @@ def remove_profile_script(profile, name):
 
 # ── Download Manager ───────────────────────────────────────────────────────────
 class DownloadManager(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, settings_ref: dict, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Downloads")
+        self._settings = settings_ref
+        self.setWindowTitle(tr("dl_title"))
         self.resize(660, 460)
         lay = QVBoxLayout(self); lay.setSpacing(10)
-        lay.addWidget(QLabel("<b style='font-size:15px'>Downloads</b>"))
+        lay.addWidget(QLabel(f"<b style='font-size:15px'>{tr('dl_title')}</b>"))
         self.list = QListWidget(); lay.addWidget(self.list)
-        b = NavButton(); b.setText("Clear completed"); b.clicked.connect(self._clear)
+        b = NavButton(); b.setText(tr("dlg_clear_done")); b.clicked.connect(self._clear)
         lay.addWidget(b, alignment=Qt.AlignRight)
         self._items: dict = {}
 
     def add_download(self, dl):
         name = dl.suggestedFileName()
+        dl_dir = self._settings.get("downloads_dir", DOWNLOADS_DIR)
+        os.makedirs(dl_dir, exist_ok=True)
         try:
-            dl.setPath(os.path.join(DOWNLOADS_DIR, name))
+            dl.setPath(os.path.join(dl_dir, name))
         except AttributeError:
             try:
-                dl.setDownloadDirectory(DOWNLOADS_DIR)
+                dl.setDownloadDirectory(dl_dir)
                 dl.setDownloadFileName(name)
             except Exception: pass
         dl.accept()
@@ -465,18 +1000,18 @@ class HistoryWindow(QDialog):
 
     def __init__(self, history: list, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("History"); self.resize(720, 560)
+        self.setWindowTitle(tr("hist_title")); self.resize(720, 560)
         self._h = history; self._q = ""
         lay = QVBoxLayout(self); lay.setSpacing(10)
-        lay.addWidget(QLabel("<b style='font-size:15px'>History</b>"))
-        s = URLBarEdit(); s.setPlaceholderText("Search history…")
+        lay.addWidget(QLabel(f"<b style='font-size:15px'>{tr('hist_title')}</b>"))
+        s = URLBarEdit(); s.setPlaceholderText(tr("hist_search_ph"))
         s.textChanged.connect(lambda t: (setattr(self,'_q',t), self._refresh()))
         lay.addWidget(s)
         self.list = QListWidget()
         self.list.itemDoubleClicked.connect(lambda i: self.open_url.emit(i.data(Qt.UserRole)))
         lay.addWidget(self.list)
         btns = QHBoxLayout()
-        for lbl, slot in (("Open",self._open),("Delete",self._delete),("Clear all",self._clear)):
+        for lbl, slot in ((tr("dlg_open"),self._open),(tr("dlg_delete"),self._delete),(tr("dlg_clear_all"),self._clear)):
             b = NavButton(); b.setText(lbl); b.clicked.connect(slot); btns.addWidget(b)
         btns.addStretch(); lay.addLayout(btns)
         self._refresh()
@@ -499,7 +1034,7 @@ class HistoryWindow(QDialog):
         self._refresh()
 
     def _clear(self):
-        if QMessageBox.question(self,"Clear History","Delete all history?",
+        if QMessageBox.question(self,tr("hist_confirm_title"),tr("hist_confirm_msg"),
                                 QMessageBox.Yes|QMessageBox.No) == QMessageBox.Yes:
             self._h.clear(); self._refresh()
 
@@ -511,12 +1046,12 @@ class BookmarkSidebar(QWidget):
         super().__init__(parent)
         self._bm = bm; self.setFixedWidth(240)
         lay = QVBoxLayout(self); lay.setContentsMargins(8,10,8,8); lay.setSpacing(8)
-        lay.addWidget(QLabel("<b>Bookmarks</b>"))
+        lay.addWidget(QLabel(f"<b>{tr('bm_title')}</b>"))
         self.list = QListWidget()
         self.list.itemDoubleClicked.connect(lambda i: self.open_url.emit(i.data(Qt.UserRole)))
         lay.addWidget(self.list)
         btns = QHBoxLayout()
-        for lbl, slot in (("Open",self._open),("Delete",self._delete)):
+        for lbl, slot in ((tr("dlg_open"),self._open),(tr("dlg_delete"),self._delete)):
             b = NavButton(); b.setText(lbl); b.clicked.connect(slot); btns.addWidget(b)
         btns.addStretch(); lay.addLayout(btns); self.refresh()
 
@@ -539,12 +1074,12 @@ class BookmarkSidebar(QWidget):
 class UserScriptsDialog(QDialog):
     def __init__(self, scripts: list, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("User Scripts (Tampermonkey-like)")
+        self.setWindowTitle(tr("us_title"))
         self.resize(720, 540); self._scripts = scripts
 
         lay = QVBoxLayout(self); lay.setSpacing(8)
-        lay.addWidget(QLabel("<b style='font-size:14px'>User Scripts</b>"))
-        lay.addWidget(QLabel("Injected on pages matching the URL pattern (glob, e.g. *google.com*)"))
+        lay.addWidget(QLabel(f"<b style='font-size:14px'>{tr('us_title')}</b>"))
+        lay.addWidget(QLabel(tr("us_hint")))
 
         self.list = QListWidget()
         self.list.currentRowChanged.connect(self._load_selected)
@@ -556,16 +1091,16 @@ class UserScriptsDialog(QDialog):
         self.code_e    = QPlainTextEdit()
         self.code_e.setPlaceholderText("// JavaScript injected when URL matches pattern\nconsole.log('hello');")
         font = QFont("Consolas",9); self.code_e.setFont(font)
-        form.addRow("Name:",    self.name_e)
-        form.addRow("URL pattern:", self.pattern_e)
-        form.addRow("Code:",   self.code_e)
+        form.addRow(tr("us_form_name"),    self.name_e)
+        form.addRow(tr("us_form_pattern"), self.pattern_e)
+        form.addRow(tr("us_form_code"),   self.code_e)
         lay.addLayout(form, 2)
 
         btns = QHBoxLayout()
-        b_new  = NavButton(); b_new.setText("New");    b_new.clicked.connect(self._new)
-        b_save = NavButton(); b_save.setText("Save");  b_save.clicked.connect(self._save_current)
-        b_del  = NavButton(); b_del.setText("Delete"); b_del.clicked.connect(self._delete)
-        b_ok   = NavButton(); b_ok.setText("Close");   b_ok.clicked.connect(self.accept)
+        b_new  = NavButton(); b_new.setText(tr("dlg_new"));    b_new.clicked.connect(self._new)
+        b_save = NavButton(); b_save.setText(tr("dlg_save"));  b_save.clicked.connect(self._save_current)
+        b_del  = NavButton(); b_del.setText(tr("dlg_delete")); b_del.clicked.connect(self._delete)
+        b_ok   = NavButton(); b_ok.setText(tr("dlg_close"));   b_ok.clicked.connect(self.accept)
         for b in (b_new, b_save, b_del, b_ok): btns.addWidget(b)
         btns.addStretch(); lay.addLayout(btns)
         self._refresh_list()
@@ -620,10 +1155,10 @@ class ExtensionsDialog(QDialog):
 
     def __init__(self, settings: dict, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Extensions"); self.resize(620, 480)
+        self.setWindowTitle(tr("ext_title")); self.resize(620, 480)
         self._s = settings
         lay = QVBoxLayout(self); lay.setSpacing(12)
-        lay.addWidget(QLabel("<b style='font-size:15px'>Extensions</b>"))
+        lay.addWidget(QLabel(f"<b style='font-size:15px'>{tr('ext_title')}</b>"))
 
         self._checks: dict = {}
         for key, name, icon, desc in self.EXTENSIONS:
@@ -643,7 +1178,7 @@ class ExtensionsDialog(QDialog):
             lay.addWidget(row)
 
         # User scripts button
-        b_us = NavButton(); b_us.setText("⚙  Manage User Scripts (Tampermonkey)")
+        b_us = NavButton(); b_us.setText(tr("us_manage"))
         b_us.clicked.connect(lambda: self.parent()._open_user_scripts() if self.parent() else None)
         lay.addWidget(b_us); lay.addStretch()
         bb = QDialogButtonBox(QDialogButtonBox.Close)
@@ -659,9 +1194,9 @@ class ThemesDialog(QDialog):
 
     def __init__(self, current: str, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Themes"); self.resize(560, 420)
+        self.setWindowTitle(tr("themes_title")); self.resize(560, 420)
         lay = QVBoxLayout(self); lay.setSpacing(12)
-        lay.addWidget(QLabel("<b style='font-size:15px'>Choose a Theme</b>"))
+        lay.addWidget(QLabel(f"<b style='font-size:15px'>{tr('themes_choose')}</b>"))
 
         grid = QGridLayout(); grid.setSpacing(10)
         for i, name in enumerate(THEME_NAMES):
@@ -691,14 +1226,14 @@ class ThemesDialog(QDialog):
 class ClearDataDialog(QDialog):
     def __init__(self, history, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Clear Browsing Data"); self.resize(400, 300)
+        self.setWindowTitle(tr("clr_title")); self.resize(400, 300)
         self._h = history
         lay = QVBoxLayout(self); lay.setSpacing(12)
-        lay.addWidget(QLabel("<b style='font-size:14px'>Clear Browsing Data</b>"))
+        lay.addWidget(QLabel(f"<b style='font-size:14px'>{tr('clr_title')}</b>"))
 
-        self.cb_hist  = QCheckBox("Browsing history");  self.cb_hist.setChecked(True)
-        self.cb_cache = QCheckBox("Cache (clears Chromium cache)")
-        self.cb_cook  = QCheckBox("Cookies and site data")
+        self.cb_hist  = QCheckBox(tr("clr_history"));  self.cb_hist.setChecked(True)
+        self.cb_cache = QCheckBox(tr("clr_cache"))
+        self.cb_cook  = QCheckBox(tr("clr_cookies"))
         for cb in (self.cb_hist, self.cb_cache, self.cb_cook):
             lay.addWidget(cb)
 
@@ -724,7 +1259,7 @@ class TabSearchDialog(QDialog):
         self.setWindowFlags(Qt.Dialog | Qt.FramelessWindowHint)
         self.resize(440, 320); self._tw = tab_widget
         lay = QVBoxLayout(self); lay.setContentsMargins(8,8,8,8); lay.setSpacing(6)
-        self.search = URLBarEdit(); self.search.setPlaceholderText("Search open tabs…")
+        self.search = URLBarEdit(); self.search.setPlaceholderText(tr("tab_search_ph"))
         self.search.textChanged.connect(self._fill)
         lay.addWidget(self.search)
         self.list = QListWidget()
@@ -754,56 +1289,339 @@ class TabSearchDialog(QDialog):
 class SettingsDialog(QDialog):
     def __init__(self, s: dict, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Settings"); self.resize(520, 420)
-        lay = QFormLayout(self); lay.setSpacing(12); lay.setContentsMargins(20,20,20,20)
-        lay.addRow(QLabel("<b style='font-size:15px'>Settings</b>"))
+        self._prev_lang = s.get("lang", "en_US")
+        self.setWindowTitle(tr("set_title"))
+        self.resize(600, 520)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
 
-        self.homepage = URLBarEdit(s.get("homepage","about:newtab"))
-        lay.addRow("Homepage:", self.homepage)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # ── Tab widget ────────────────────────────────────────────────────────
+        tabs = QTabWidget()
+        tabs.setDocumentMode(False)
+        tabs.setTabPosition(QTabWidget.North)
+        root.addWidget(tabs, 1)
+
+        # helper: returns (QScrollArea, QFormLayout) for a tab page
+        def _page():
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QScrollArea.NoFrame)
+            inner = QWidget()
+            form = QFormLayout(inner)
+            form.setSpacing(12)
+            form.setContentsMargins(20, 16, 20, 20)
+            form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            scroll.setWidget(inner)
+            return scroll, form
+
+        # ── Tab 1: General ────────────────────────────────────────────────────
+        p1, f1 = _page()
+        tabs.addTab(p1, tr("set_sec_general"))
+
+        self.lang = QComboBox()
+        self.lang.addItem("English (US)", "en_US")
+        self.lang.addItem("Русский (Россия)", "ru_RU")
+        cur_lang = s.get("lang", "en_US")
+        self.lang.setCurrentIndex(0 if cur_lang == "en_US" else 1)
+        f1.addRow(tr("set_lang"), self.lang)
+
+        # Homepage
+        from PyQt5.QtWidgets import QRadioButton, QButtonGroup
+        cur_hp = s.get("homepage", "about:newtab")
+        is_newtab = (cur_hp in ("about:newtab", "about:blank", ""))
+        hp_wrap = QWidget()
+        hp_lay = QVBoxLayout(hp_wrap)
+        hp_lay.setContentsMargins(0, 0, 0, 0)
+        hp_lay.setSpacing(4)
+        self._hp_group  = QButtonGroup(self)
+        self._hp_newtab = QRadioButton(tr("set_hp_newtab"))
+        self._hp_custom = QRadioButton(tr("set_hp_custom"))
+        self._hp_group.addButton(self._hp_newtab, 0)
+        self._hp_group.addButton(self._hp_custom, 1)
+        self.homepage = URLBarEdit(cur_hp if not is_newtab else "")
+        self.homepage.setPlaceholderText("https://example.com")
+        self.homepage.setEnabled(not is_newtab)
+        self._hp_newtab.setChecked(is_newtab)
+        self._hp_custom.setChecked(not is_newtab)
+        def _on_hp_toggle():
+            use_custom = self._hp_custom.isChecked()
+            self.homepage.setEnabled(use_custom)
+            if use_custom: self.homepage.setFocus()
+        self._hp_group.buttonClicked.connect(lambda _: _on_hp_toggle())
+        hp_lay.addWidget(self._hp_newtab)
+        hp_lay.addWidget(self._hp_custom)
+        hp_lay.addWidget(self.homepage)
+        f1.addRow(tr("set_homepage"), hp_wrap)
 
         self.engine = QComboBox()
-        for name, url in SEARCH_ENGINES.items(): self.engine.addItem(name, url)
+        for name, url in SEARCH_ENGINES.items():
+            self.engine.addItem(name, url)
         cur = s.get("search_engine", DEFAULTS["search_engine"])
         if cur in SEARCH_ENGINES.values():
             self.engine.setCurrentIndex(list(SEARCH_ENGINES.values()).index(cur))
-        lay.addRow("Search engine:", self.engine)
+        f1.addRow(tr("set_engine"), self.engine)
 
-        self.zoom = QSpinBox(); self.zoom.setRange(25,500); self.zoom.setSuffix(" %")
-        self.zoom.setValue(s.get("zoom",100)); lay.addRow("Default zoom:", self.zoom)
+        self.zoom = QSpinBox()
+        self.zoom.setRange(25, 500)
+        self.zoom.setSuffix(" %")
+        self.zoom.setValue(s.get("zoom", 100))
+        f1.addRow(tr("set_zoom"), self.zoom)
 
-        self.restore = QCheckBox("Restore last session on startup")
-        self.restore.setChecked(s.get("restore_session",False)); lay.addRow(self.restore)
+        self.restore = QCheckBox(tr("set_restore"))
+        self.restore.setChecked(s.get("restore_session", False))
+        f1.addRow("", self.restore)
 
-        self.ua = URLBarEdit(s.get("user_agent",""))
-        self.ua.setPlaceholderText("Leave empty for default")
-        lay.addRow("User-Agent override:", self.ua)
+        dl_row = QWidget()
+        dl_lay = QHBoxLayout(dl_row)
+        dl_lay.setContentsMargins(0, 0, 0, 0)
+        self.dl_dir = URLBarEdit(s.get("downloads_dir", DOWNLOADS_DIR))
+        btn_browse = NavButton()
+        btn_browse.setText("…")
+        btn_browse.setFixedWidth(32)
+        btn_browse.clicked.connect(self._browse)
+        dl_lay.addWidget(self.dl_dir, 1)
+        dl_lay.addWidget(btn_browse)
+        f1.addRow(tr("set_dl_folder"), dl_row)
 
+        # ── Tab 2: Content ────────────────────────────────────────────────────
+        p2, f2 = _page()
+        tabs.addTab(p2, tr("set_sec_content"))
+
+        self.javascript = QCheckBox(tr("set_js"))
+        self.javascript.setChecked(s.get("javascript", True))
+        f2.addRow("", self.javascript)
+
+        self.popups = QCheckBox(tr("set_popups"))
+        self.popups.setChecked(s.get("block_popups", True))
+        f2.addRow("", self.popups)
+
+        self.dark_reader = QCheckBox(tr("set_dark"))
+        self.dark_reader.setChecked(s.get("dark_reader", False))
+        f2.addRow("", self.dark_reader)
+
+        # ── Tab 3: Security ───────────────────────────────────────────────────
+        p3, f3 = _page()
+        tabs.addTab(p3, tr("set_sec_security"))
+
+        self.mixed = QCheckBox(tr("set_mixed"))
+        self.mixed.setChecked(s.get("block_mixed_content", True))
+        f3.addRow("", self.mixed)
+
+        self.webrtc = QCheckBox(tr("set_webrtc"))
+        self.webrtc.setChecked(s.get("webrtc_protection", True))
+        f3.addRow("", self.webrtc)
+
+        self.dnt = QCheckBox(tr("set_dnt"))
+        self.dnt.setChecked(s.get("dnt", True))
+        f3.addRow("", self.dnt)
+
+        self.referrer = QComboBox()
+        for lbl, val in ((tr("ref_full"), "full"),
+                         (tr("ref_origin"), "strict-origin"),
+                         (tr("ref_none"), "no-referrer")):
+            self.referrer.addItem(lbl, val)
+        cur_ref = s.get("referrer_policy", "strict-origin")
+        self.referrer.setCurrentIndex(
+            next((i for i in range(self.referrer.count())
+                  if self.referrer.itemData(i) == cur_ref), 1))
+        f3.addRow(tr("set_referrer"), self.referrer)
+
+        self.safe_browsing = QCheckBox(tr("set_safe_browsing"))
+        self.safe_browsing.setChecked(s.get("safe_browsing", True))
+        f3.addRow("", self.safe_browsing)
+
+        # Permissions sub-header
+        _perms_title = "Разрешения" if s.get("lang","en_US") == "ru_RU" else "Permissions"
+        sep_lbl = QLabel("<b style='font-size:11px; color:gray;'>— " + _perms_title + " —</b>")
+        f3.addRow(sep_lbl)
+
+        perm_opts = [(tr("perm_ask"), "ask"), (tr("perm_deny"), "deny"), (tr("perm_allow"), "allow")]
+        self._perms = {}
+        for pkey, lkey, default in (
+            ("permission_camera",        "set_cam",   "ask"),
+            ("permission_mic",           "set_mic",   "ask"),
+            ("permission_location",      "set_loc",   "deny"),
+            ("permission_notifications", "set_notif", "ask"),
+        ):
+            cb = QComboBox()
+            for pl, pv in perm_opts:
+                cb.addItem(pl, pv)
+            cur = s.get(pkey, default)
+            cb.setCurrentIndex(next((i for i in range(cb.count()) if cb.itemData(i) == cur), 0))
+            self._perms[pkey] = cb
+            f3.addRow(tr(lkey), cb)
+
+        # ── Tab 4: Advanced ───────────────────────────────────────────────────
+        p4, f4 = _page()
+        tabs.addTab(p4, tr("set_sec_advanced"))
+
+        self.ua = URLBarEdit(s.get("user_agent", ""))
+        self.ua.setPlaceholderText(tr("set_ua_ph"))
+        f4.addRow(tr("set_ua"), self.ua)
+
+        # ── Button box ────────────────────────────────────────────────────────
+        bb_wrap = QWidget()
+        bb_lay = QHBoxLayout(bb_wrap)
+        bb_lay.setContentsMargins(16, 8, 16, 12)
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        bb.accepted.connect(self.accept); bb.rejected.connect(self.reject)
-        lay.addRow(bb)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        bb_lay.addWidget(bb)
+        root.addWidget(bb_wrap)
+
+    def _browse(self):
+        d = QFileDialog.getExistingDirectory(self, tr("set_dl_folder"), self.dl_dir.text())
+        if d: self.dl_dir.setText(d)
 
     def result(self) -> dict:
-        return {"homepage": self.homepage.text(),
-                "search_engine": self.engine.currentData(),
-                "zoom": self.zoom.value(),
-                "restore_session": self.restore.isChecked(),
-                "user_agent": self.ua.text()}
+        d = {
+            "lang":                  self.lang.currentData(),
+            "homepage":              "about:newtab" if self._hp_newtab.isChecked()
+                                     else (self.homepage.text().strip() or "about:newtab"),
+            "search_engine":         self.engine.currentData(),
+            "zoom":                  self.zoom.value(),
+            "restore_session":       self.restore.isChecked(),
+            "downloads_dir":         self.dl_dir.text(),
+            "javascript":            self.javascript.isChecked(),
+            "block_popups":          self.popups.isChecked(),
+            "dark_reader":           self.dark_reader.isChecked(),
+            "user_agent":            self.ua.text(),
+            # Security
+            "block_mixed_content":   self.mixed.isChecked(),
+            "webrtc_protection":     self.webrtc.isChecked(),
+            "dnt":                   self.dnt.isChecked(),
+            "referrer_policy":       self.referrer.currentData(),
+            "safe_browsing":         self.safe_browsing.isChecked(),
+        }
+        for pkey, cb in self._perms.items():
+            d[pkey] = cb.currentData()
+        return d
+
+    def lang_changed(self) -> bool:
+        return self.lang.currentData() != self._prev_lang
+
+# ── About Dialog ──────────────────────────────────────────────────────────────
+class AboutDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(tr("menu_about"))
+        self.setFixedSize(400, 340)
+        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(32, 28, 32, 20)
+        lay.setSpacing(0)
+
+        # ── Logo row ──
+        logo_lbl = QLabel("🌐")
+        logo_lbl.setAlignment(Qt.AlignCenter)
+        logo_lbl.setStyleSheet("font-size:56px; margin-bottom:4px;")
+        lay.addWidget(logo_lbl)
+
+        # ── Name ──
+        name_lbl = QLabel("ES-Browser")
+        name_lbl.setAlignment(Qt.AlignCenter)
+        name_lbl.setStyleSheet("font-size:22px; font-weight:700; letter-spacing:1px;")
+        lay.addWidget(name_lbl)
+
+        # ── Version ──
+        ver_lbl = QLabel("Version 4.0  •  Built with PyQt5 + Chromium")
+        ver_lbl.setAlignment(Qt.AlignCenter)
+        ver_lbl.setStyleSheet("font-size:11px; opacity:.7; margin-top:4px; margin-bottom:18px;")
+        lay.addWidget(ver_lbl)
+
+        # ── Divider ──
+        line = QFrame(); line.setFrameShape(QFrame.HLine)
+        line.setStyleSheet("color: rgba(128,128,128,0.3);")
+        lay.addWidget(line)
+        lay.addSpacing(14)
+
+        # ── Info grid ──
+        info = [
+            ("Engine",   "Chromium  (PyQtWebEngine)"),
+            ("UI",       "PyQt5"),
+            ("Platform", f"{sys.platform.title()}  •  Python {sys.version.split()[0]}"),
+            ("Author",   "Jemyz3653"),
+        ]
+        for label, value in info:
+            row = QHBoxLayout()
+            k = QLabel(label + ":")
+            k.setFixedWidth(80)
+            k.setStyleSheet("font-weight:600; font-size:12px;")
+            v = QLabel(value)
+            v.setStyleSheet("font-size:12px;")
+            row.addWidget(k); row.addWidget(v); row.addStretch()
+            lay.addLayout(row)
+            lay.addSpacing(4)
+
+        lay.addSpacing(16)
+
+        # ── Close button ──
+        btn = QPushButton("Close")
+        btn.setFixedWidth(100)
+        btn.setStyleSheet(
+            "QPushButton{border-radius:7px;padding:7px 0;font-weight:600;font-size:13px;}"
+        )
+        btn.clicked.connect(self.accept)
+        lay.addWidget(btn, alignment=Qt.AlignCenter)
+
+
+# ── Mouse back/forward button filter ──────────────────────────────────────────
+class _NavMouseFilter(QObject):
+    """Перехватывает XButton1/XButton2 (боковые кнопки мыши) на уровне приложения.
+    Работает даже когда фокус внутри QWebEngineView (Chromium не перехватывает XButton).
+    """
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.MouseButtonPress:
+            btn = event.button()
+            # Qt.BackButton == Qt.XButton1, Qt.ForwardButton == Qt.XButton2
+            if btn in (Qt.BackButton, Qt.XButton1):
+                win = QApplication.activeWindow()
+                if isinstance(win, MainWindow):
+                    win.go_back()
+                return True
+            if btn in (Qt.ForwardButton, Qt.XButton2):
+                win = QApplication.activeWindow()
+                if isinstance(win, MainWindow):
+                    win.go_forward()
+                return True
+        return False
+
+# ── Custom Page (fullscreen + popups) ─────────────────────────────────────────
+class BrowserPage(QWebEnginePage):
+    """QWebEnginePage с поддержкой полноэкранного режима и попапов."""
+    open_in_new_tab = pyqtSignal(str)   # url для открытия в новой вкладке
+
+    def createWindow(self, win_type):
+        """Перехватываем window.open() и target="_blank" — открываем новую вкладку."""
+        tmp = BrowserPage(self.profile(), None)
+        # Как только временная страница получит URL — передаём его наверх
+        tmp.urlChanged.connect(
+            lambda u: self.open_in_new_tab.emit(u.toString()) if u.isValid() and u.scheme() not in ('', 'about') else None
+        )
+        return tmp
+
+    def javaScriptConsoleMessage(self, level, msg, line, source):
+        pass   # подавляем шум в консоли
 
 # ── Find Bar ───────────────────────────────────────────────────────────────────
 class FindBar(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         lay = QHBoxLayout(self); lay.setContentsMargins(6,3,6,3); lay.setSpacing(4)
-        self.input = URLBarEdit(); self.input.setPlaceholderText("Find in page…")
+        self.input = URLBarEdit(); self.input.setPlaceholderText(tr("find_ph"))
         self.input.returnPressed.connect(self._next)
         self.input.textChanged.connect(self._live)
         self._case = NavButton(); self._case.setText("Aa"); self._case.setCheckable(True)
-        self._case.setToolTip("Case sensitive")
+        self._case.setToolTip(tr("find_case"))
         self._result = QLabel(); self._result.setMinimumWidth(80)
         b_prev  = NavButton(); b_prev.setText("▲");  b_prev.clicked.connect(self._prev)
         b_next  = NavButton(); b_next.setText("▼");  b_next.clicked.connect(self._next)
         b_close = NavButton(); b_close.setText("✕"); b_close.clicked.connect(self.hide_bar)
-        for w in (QLabel("  Find:"),self.input,self._case,b_prev,b_next,self._result,b_close):
+        for w in (QLabel(tr("find_label")),self.input,self._case,b_prev,b_next,self._result,b_close):
             lay.addWidget(w)
         self.view: QWebEngineView = None  # type: ignore
         self.hide()
@@ -823,17 +1641,17 @@ class FindBar(QWidget):
     def _live(self, t):
         if self.view:
             self.view.findText(t, self._flags(),
-                lambda ok: self._result.setText("" if ok else "Not found"))
+                lambda ok: self._result.setText("" if ok else tr("find_not_found")))
 
     def _next(self):
         if self.view:
             self.view.findText(self.input.text(), self._flags(),
-                lambda ok: self._result.setText("" if ok else "Not found"))
+                lambda ok: self._result.setText("" if ok else tr("find_not_found")))
 
     def _prev(self):
         if self.view:
             self.view.findText(self.input.text(), self._flags(bwd=True),
-                lambda ok: self._result.setText("" if ok else "Not found"))
+                lambda ok: self._result.setText("" if ok else tr("find_not_found")))
 
 # ── Browser Tab ────────────────────────────────────────────────────────────────
 class BrowserTab(QWidget):
@@ -851,14 +1669,40 @@ class BrowserTab(QWidget):
         lay = QVBoxLayout(self); lay.setContentsMargins(0,0,0,0); lay.setSpacing(0)
 
         self.view = QWebEngineView()
-        self.view.setPage(QWebEnginePage(profile, self.view))
+        page = BrowserPage(profile, self.view)
+        self.view.setPage(page)
+        # Попапы → новая вкладка в MainWindow
+        page.open_in_new_tab.connect(self._open_popup)
+        # Полноэкранный режим (YouTube, видеоплееры)
+        try:
+            page.fullScreenRequested.connect(self._handle_fullscreen)
+        except AttributeError:
+            pass
         ws = self.view.settings()
-        for attr in (QWebEngineSettings.JavascriptEnabled,
-                     QWebEngineSettings.PluginsEnabled,
-                     QWebEngineSettings.FullScreenSupportEnabled,
-                     QWebEngineSettings.ScrollAnimatorEnabled,
-                     QWebEngineSettings.LocalStorageEnabled):
+
+        # Базовые атрибуты (AllowRunningInsecureContent управляется профилем)
+        for attr in (
+            QWebEngineSettings.JavascriptEnabled,
+            QWebEngineSettings.PluginsEnabled,
+            QWebEngineSettings.FullScreenSupportEnabled,
+            QWebEngineSettings.ScrollAnimatorEnabled,
+            QWebEngineSettings.LocalStorageEnabled,
+            QWebEngineSettings.JavascriptCanAccessClipboard,
+            QWebEngineSettings.JavascriptCanOpenWindows,
+        ):
             ws.setAttribute(attr, True)
+
+        # Атрибуты, которых может не быть в старых версиях PyQtWebEngine
+        for _name in ("WebGLEnabled", "ServiceWorkerEnabled",
+                      "AllowWindowActivationFromJavaScript",
+                      "PdfViewerEnabled"):
+            try:
+                ws.setAttribute(getattr(QWebEngineSettings, _name), True)
+            except AttributeError:
+                pass
+
+        # Автоматически принимать разрешения (камера, микрофон и т.д.)
+        self.view.page().featurePermissionRequested.connect(self._grant_permission)
 
         self.view.titleChanged.connect(self.title_changed)
         self.view.urlChanged.connect(lambda u: self.url_changed.emit(u.toString()))
@@ -867,20 +1711,85 @@ class BrowserTab(QWidget):
         self.view.loadStarted.connect(self.load_started)
         self.view.loadProgress.connect(self.load_progress)
         self.view.loadFinished.connect(self.load_finished)
+        # Применять зум при каждой загрузке страницы
+        self.view.loadStarted.connect(self._apply_zoom)
 
         self.find_bar = FindBar(); self.find_bar.attach(self.view)
         lay.addWidget(self.view); lay.addWidget(self.find_bar)
 
+    def _apply_zoom(self):
+        self.view.setZoomFactor(self._s.get("zoom", 100) / 100.0)
+
+    def _open_popup(self, url: str):
+        """Открыть попап (window.open) в новой вкладке."""
+        if url and url not in ("about:blank", ""):
+            win = self.window()
+            if hasattr(win, "new_tab"):
+                win.new_tab(url=url)
+
+    def _handle_fullscreen(self, request):
+        """Обработка fullscreen-запросов от страниц (YouTube, видеоплееры)."""
+        request.accept()
+        win = self.window()
+        if not hasattr(win, "_enter_fullscreen"):
+            return
+        try:
+            going_fs = request.toggleOn()
+        except AttributeError:
+            going_fs = not win.isFullScreen()
+        if going_fs:
+            win._enter_fullscreen()
+        else:
+            win._exit_fullscreen()
+
     def navigate(self, url: str):
-        if url == "about:newtab":
-            self.load_new_tab(); return
+        if url in ("about:newtab", "about:blank", ""):
+            theme = self._s.get("theme", "Catppuccin Mocha")
+            se    = self._s.get("search_engine", "https://www.google.com/search?q=")
+            self.load_new_tab(theme, se); return
         u = QUrl(url)
         if not u.scheme(): u = QUrl("https://" + url)
         self.view.load(u)
 
-    def load_new_tab(self, theme="Catppuccin Mocha"):
-        html = build_newtab_html(theme_name=theme)
+    def load_new_tab(self, theme="Catppuccin Mocha",
+                     search_engine="https://www.google.com/search?q="):
+        html = build_newtab_html(theme_name=theme, search_engine=search_engine)
         self.view.setHtml(html, QUrl("about:newtab"))
+
+    def _grant_permission(self, url, feature):
+        """Обрабатывать разрешения согласно настройкам (ask/deny/allow)."""
+        feature_map = {
+            QWebEnginePage.MediaAudioCapture:      ("permission_mic",           "perm_mic"),
+            QWebEnginePage.MediaVideoCapture:      ("permission_camera",        "perm_cam"),
+            QWebEnginePage.MediaAudioVideoCapture: ("permission_camera",        "perm_cam_mic"),
+            QWebEnginePage.Geolocation:            ("permission_location",      "perm_geo"),
+            QWebEnginePage.Notifications:          ("permission_notifications", "perm_notif"),
+        }
+        entry = feature_map.get(feature)
+        if entry:
+            policy    = self._s.get(entry[0], "ask")
+            feat_name = tr(entry[1])
+        else:
+            policy    = "ask"
+            feat_name = "Permission"
+
+        if policy == "allow":
+            grant = True
+        elif policy == "deny":
+            grant = False
+        else:  # ask
+            reply = QMessageBox.question(
+                self,
+                tr("perm_ask_title"),
+                tr("perm_ask_msg").format(url.host(), feat_name),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            grant = (reply == QMessageBox.Yes)
+
+        perm = (QWebEnginePage.PermissionGrantedByUser if grant
+                else QWebEnginePage.PermissionDeniedByUser)
+        self.view.page().setFeaturePermission(url, feature, perm)
 
     def zoom_in(self):   self.view.setZoomFactor(min(5.0, self.view.zoomFactor()+0.1))
     def zoom_out(self):  self.view.setZoomFactor(max(0.25,self.view.zoomFactor()-0.1))
@@ -929,6 +1838,9 @@ class MainWindow(QMainWindow):
         self.history      = load_json(HISTORY_F, [])
         self.sessions     = load_json(SESSIONS_F, {})
         self.user_scripts = load_json(USER_SCRIPTS_F, [])
+        # Устанавливаем язык до построения UI
+        global _current_lang
+        _current_lang = self.settings.get("lang", "en_US")
         self._closed_tabs: list = []
         self._is_loading  = False
         self._zoom_timer  = None
@@ -937,9 +1849,29 @@ class MainWindow(QMainWindow):
         if private_window:
             self.profile = QWebEngineProfile(self)        # off-the-record
         else:
-            self.profile = QWebEngineProfile("PyBrowser", self)
+            self.profile = QWebEngineProfile("ESBrowser", self)
 
         self.private_profile = QWebEngineProfile(self)    # always off-the-record
+
+        # Применяем настройки WebEngine на уровне профиля (до создания вкладок)
+        self._init_profile_settings(self.profile)
+        self._init_profile_settings(self.private_profile)
+        # Mixed content согласно настройкам
+        for _p in (self.profile, self.private_profile):
+            _p.settings().setAttribute(
+                QWebEngineSettings.AllowRunningInsecureContent,
+                not self.settings.get("block_mixed_content", True))
+
+        # Chrome-спуфинг: window.chrome, navigator.vendor и т.д.
+        # Нужен чтобы Google/YouTube не блокировали вход через «небезопасный браузер»
+        for _p in (self.profile, self.private_profile):
+            add_profile_script(_p, "__pb_chrome_spoof__", CHROME_SPOOF_JS,
+                               QWebEngineScript.DocumentCreation)
+
+        # User-Agent: Chrome 120 по умолчанию — нужен для YouTube и современных сайтов
+        ua = self.settings.get("user_agent") or CHROME_UA
+        self.profile.setHttpUserAgent(ua)
+        self.private_profile.setHttpUserAgent(ua)
 
         # Interceptor
         self._interceptor = None
@@ -947,12 +1879,12 @@ class MainWindow(QMainWindow):
             self._interceptor = RequestInterceptor()
             self._interceptor.ad_block         = self.settings.get("ad_block", True)
             self._interceptor.https_everywhere = self.settings.get("https_everywhere", False)
+            self._interceptor.dnt              = self.settings.get("dnt", True)
+            self._interceptor.referrer_policy  = self.settings.get("referrer_policy", "strict-origin")
             install_interceptor(self.profile, self._interceptor)
+            install_interceptor(self.private_profile, self._interceptor)
 
-        if self.settings.get("user_agent"):
-            self.profile.setHttpUserAgent(self.settings["user_agent"])
-
-        self._dl_mgr = DownloadManager(self)
+        self._dl_mgr = DownloadManager(self.settings, self)
         self.profile.downloadRequested.connect(self._dl_mgr.add_download)
         self.private_profile.downloadRequested.connect(self._dl_mgr.add_download)
 
@@ -961,7 +1893,7 @@ class MainWindow(QMainWindow):
         self._apply_all_scripts()
 
         if private_window:
-            self.setWindowTitle("Private Browsing — PyBrowser")
+            self.setWindowTitle(tr("priv_win_title"))
             self.new_tab()
         elif self.settings.get("restore_session") and self.sessions.get("last"):
             for entry in self.sessions["last"]:
@@ -970,16 +1902,50 @@ class MainWindow(QMainWindow):
             self.new_tab()
 
     # ── Script management ──────────────────────────────────────────────────────
+    # ── Profile-level WebEngine settings ──────────────────────────────────────
+    def _init_profile_settings(self, profile):
+        """Включить JS, WebGL, Service Workers и прочее на уровне профиля."""
+        ps = profile.settings()
+        for attr in (
+            QWebEngineSettings.JavascriptEnabled,
+            QWebEngineSettings.PluginsEnabled,
+            QWebEngineSettings.FullScreenSupportEnabled,
+            QWebEngineSettings.ScrollAnimatorEnabled,
+            QWebEngineSettings.LocalStorageEnabled,
+            QWebEngineSettings.JavascriptCanAccessClipboard,
+            QWebEngineSettings.JavascriptCanOpenWindows,
+        ):
+            ps.setAttribute(attr, True)
+        # Смешанный контент: по умолчанию заблокирован (настраивается)
+        ps.setAttribute(QWebEngineSettings.AllowRunningInsecureContent, False)
+        for _name in ("WebGLEnabled", "ServiceWorkerEnabled",
+                      "AllowWindowActivationFromJavaScript",
+                      "PdfViewerEnabled"):
+            try:
+                ps.setAttribute(getattr(QWebEngineSettings, _name), True)
+            except AttributeError:
+                pass
+
     def _apply_all_scripts(self):
+        # WebRTC IP leak protection
+        if self.settings.get("webrtc_protection", True):
+            add_profile_script(self.profile, "__pb_webrtc__", WEBRTC_PROTECTION_JS,
+                               QWebEngineScript.DocumentCreation)
+            add_profile_script(self.private_profile, "__pb_webrtc__", WEBRTC_PROTECTION_JS,
+                               QWebEngineScript.DocumentCreation)
+        else:
+            remove_profile_script(self.profile, "__pb_webrtc__")
+            remove_profile_script(self.private_profile, "__pb_webrtc__")
         # Dark Reader
         if self.settings.get("dark_reader"):
             add_profile_script(self.profile, "__pb_dr__", DARK_READER_JS,
                                QWebEngineScript.DocumentReady)
         else:
             remove_profile_script(self.profile, "__pb_dr__")
-        # Ruffle
+        # Ruffle — DocumentReady, иначе document.head ещё null
         if self.settings.get("ruffle"):
-            add_profile_script(self.profile, "__pb_ruffle__", RUFFLE_JS)
+            add_profile_script(self.profile, "__pb_ruffle__", RUFFLE_JS,
+                               QWebEngineScript.DocumentReady)
         else:
             remove_profile_script(self.profile, "__pb_ruffle__")
         # User scripts
@@ -1016,7 +1982,7 @@ if(!_url.match({json.dumps(fnmatch.translate(s.get("pattern","*")))})) return;
             priv_bar.setFixedHeight(32)
             pl = QHBoxLayout(priv_bar); pl.setContentsMargins(12,0,12,0)
             pl.addWidget(QLabel("🕵"))
-            lbl = QLabel("<b>Private Browsing</b> — history and cookies won't be saved")
+            lbl = QLabel(tr("priv_bar"))
             lbl.setStyleSheet("color:#d0c0ff;")
             pl.addWidget(lbl); pl.addStretch()
             rl.addWidget(priv_bar)
@@ -1031,7 +1997,7 @@ if(!_url.match({json.dumps(fnmatch.translate(s.get("pattern","*")))})) return;
         rl.addWidget(self.tabs)
 
         btn_plus = NavButton(); btn_plus.setText("+")
-        btn_plus.setToolTip("New tab  Ctrl+T"); btn_plus.setFixedSize(30,28)
+        btn_plus.setToolTip(tr("tip_new_tab")); btn_plus.setFixedSize(30,28)
         btn_plus.clicked.connect(self.new_tab)
         self.tabs.setCornerWidget(btn_plus, Qt.TopRightCorner)
 
@@ -1057,13 +2023,13 @@ if(!_url.match({json.dumps(fnmatch.translate(s.get("pattern","*")))})) return;
             b.setFixedSize(34,34); b.setCheckable(checkable)
             b.clicked.connect(slot); return b
 
-        self._btn_back  = nav("◀","Back  Alt+←",     self.go_back)
-        self._btn_fwd   = nav("▶","Forward  Alt+→",   self.go_forward)
-        self._btn_home  = nav("⌂","Home",             self.go_home)
+        self._btn_back  = nav("◀", tr("tip_back"),    self.go_back)
+        self._btn_fwd   = nav("▶", tr("tip_forward"), self.go_forward)
+        self._btn_home  = nav("⌂", tr("tip_home"),    self.go_home)
 
         # URL bar
         self._url_bar = URLBarEdit()
-        self._url_bar.setPlaceholderText("Search or enter URL…")
+        self._url_bar.setPlaceholderText(tr("url_ph"))
         self._url_bar.returnPressed.connect(self._navigate_from_bar)
         self._url_bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self._url_bar.setFixedHeight(34)
@@ -1074,10 +2040,9 @@ if(!_url.match({json.dumps(fnmatch.translate(s.get("pattern","*")))})) return;
             emoji_icon("↻","#888"), QLineEdit.TrailingPosition)
         self._rl_action.triggered.connect(self._reload_or_stop)
 
-        self._btn_star  = nav("☆","Bookmark  Ctrl+D", self.toggle_bookmark)
-        self._btn_dark  = nav("🌙","Toggle site dark mode", self._toggle_dark_reader, checkable=True)
+        self._btn_star  = nav("☆", tr("tip_bookmark"), self.toggle_bookmark)
+        self._btn_dark  = nav("🌙", tr("tip_dark"), self._toggle_dark_reader, checkable=True)
         self._btn_dark.setChecked(self.settings.get("dark_reader",False))
-        self._btn_dark.setToolTip("Dark mode for websites")
 
         for w in (self._btn_back,self._btn_fwd,self._btn_home):
             self._toolbar.addWidget(w)
@@ -1096,113 +2061,127 @@ if(!_url.match({json.dumps(fnmatch.translate(s.get("pattern","*")))})) return;
             menu.addAction(a); return a
 
         # File
-        fm = mb.addMenu("File")
-        act(fm,"New Tab",              "Ctrl+T",       self.new_tab)
-        act(fm,"New Private Tab",      "Ctrl+Shift+P", lambda: self.new_tab(private=True))
-        act(fm,"New Private Window",   "Ctrl+Shift+N", self.open_private_window)
-        act(fm,"Close Tab",            "Ctrl+W",       lambda: self.close_tab(self.tabs.currentIndex()))
-        act(fm,"Reopen Closed Tab",    "Ctrl+Shift+T", self._restore_closed_tab)
+        fm = mb.addMenu(tr("menu_file"))
+        act(fm, tr("menu_new_tab"),        "Ctrl+T",           self.new_tab)
+        act(fm, tr("menu_new_priv_tab"),   "Ctrl+Shift+P",     lambda: self.new_tab(private=True))
+        act(fm, tr("menu_new_priv_win"),   "Ctrl+Shift+N",     self.open_private_window)
+        act(fm, tr("menu_close_tab"),      "Ctrl+W",           lambda: self.close_tab(self.tabs.currentIndex()))
+        act(fm, tr("menu_reopen_tab"),     "Ctrl+Shift+T",     self._restore_closed_tab)
         fm.addSeparator()
-        act(fm,"Save Page",            "Ctrl+S",       lambda: (t:=self._cur()) and t.save_page())
-        act(fm,"Screenshot",           "Ctrl+Shift+S", lambda: (t:=self._cur()) and t.screenshot())
-        act(fm,"Print",                "Ctrl+P",       lambda: (t:=self._cur()) and t.print_page())
+        act(fm, tr("menu_save_page"),      "Ctrl+S",           lambda: (t:=self._cur()) and t.save_page())
+        act(fm, tr("menu_screenshot"),     "Ctrl+Shift+S",     lambda: (t:=self._cur()) and t.screenshot())
+        act(fm, tr("menu_print"),          "Ctrl+P",           lambda: (t:=self._cur()) and t.print_page())
         fm.addSeparator()
-        act(fm,"Quit",                 "Ctrl+Q",       self.close)
+        act(fm, tr("menu_quit"),           "Ctrl+Q",           self.close)
 
         # Edit
-        em = mb.addMenu("Edit")
-        act(em,"Find in Page",         "Ctrl+F",       lambda: (t:=self._cur()) and t.toggle_find())
+        em = mb.addMenu(tr("menu_edit"))
+        act(em, tr("menu_find"),           "Ctrl+F",           lambda: (t:=self._cur()) and t.toggle_find())
         em.addSeparator()
-        act(em,"Select All",           "Ctrl+A",
+        act(em, tr("menu_select_all"),     "Ctrl+A",
             lambda: self._cur() and self._cur().view.page().triggerAction(QWebEnginePage.SelectAll))
-        act(em,"Copy",                 "Ctrl+C",
+        act(em, tr("menu_copy"),           "Ctrl+C",
             lambda: self._cur() and self._cur().view.page().triggerAction(QWebEnginePage.Copy))
 
         # View
-        vm = mb.addMenu("View")
-        act(vm,"Zoom In",              "Ctrl+=",       lambda: (t:=self._cur()) and t.zoom_in())
-        act(vm,"Zoom Out",             "Ctrl+-",       lambda: (t:=self._cur()) and t.zoom_out())
-        act(vm,"Reset Zoom",           "Ctrl+0",       lambda: (t:=self._cur()) and t.zoom_reset())
+        vm = mb.addMenu(tr("menu_view"))
+        act(vm, tr("menu_zoom_in"),        "Ctrl+=",           lambda: (t:=self._cur()) and t.zoom_in())
+        act(vm, tr("menu_zoom_out"),       "Ctrl+-",           lambda: (t:=self._cur()) and t.zoom_out())
+        act(vm, tr("menu_zoom_reset"),     "Ctrl+0",           lambda: (t:=self._cur()) and t.zoom_reset())
         vm.addSeparator()
-        act(vm,"Full Screen",          "F11",          self.toggle_fullscreen)
+        act(vm, tr("menu_fullscreen"),     "F11",              self.toggle_fullscreen)
         vm.addSeparator()
-        act(vm,"Bookmarks Sidebar",    "Ctrl+B",       self.toggle_sidebar)
-        act(vm,"Reader Mode",          "Alt+R",        lambda: (t:=self._cur()) and t.reader_mode())
-        act(vm,"Translate Page",       "Alt+T",        lambda: (t:=self._cur()) and t.translate_page())
+        act(vm, tr("menu_bm_sidebar"),     "Ctrl+B",           self.toggle_sidebar)
+        act(vm, tr("menu_reader"),         "Alt+R",            lambda: (t:=self._cur()) and t.reader_mode())
+        act(vm, tr("menu_translate"),      "Alt+T",            lambda: (t:=self._cur()) and t.translate_page())
         vm.addSeparator()
-        self._dark_menu_act = act(vm,"Site Dark Mode (Dark Reader)","Alt+D",
+        self._dark_menu_act = act(vm, tr("menu_dark_mode"),    "Alt+D",
                                   self._toggle_dark_reader, checkable=True)
-        self._dark_menu_act.setChecked(self.settings.get("dark_reader",False))
+        self._dark_menu_act.setChecked(self.settings.get("dark_reader", False))
 
         # History
-        hm = mb.addMenu("History")
-        act(hm,"Show History",         "Ctrl+H",       self.show_history)
-        act(hm,"Clear Browsing Data",  "Ctrl+Shift+Delete", self.show_clear_data)
+        hm = mb.addMenu(tr("menu_history"))
+        act(hm, tr("menu_show_history"),   "Ctrl+H",           self.show_history)
+        act(hm, tr("menu_clear_data"),     "Ctrl+Shift+Delete", self.show_clear_data)
         hm.addSeparator()
-        act(hm,"Save Session",         "",             lambda: self._save_session("last"))
-        act(hm,"Restore Session",      "",             self._restore_session_dialog)
+        act(hm, tr("menu_save_session"),   "",                 lambda: self._save_session("last"))
+        act(hm, tr("menu_restore_session"),"",                 self._restore_session_dialog)
 
         # Bookmarks
-        bkm = mb.addMenu("Bookmarks")
-        act(bkm,"Bookmark This Page",  "Ctrl+D",       self.toggle_bookmark)
-        act(bkm,"Bookmarks Sidebar",   "Ctrl+Shift+B", self.toggle_sidebar)
+        bkm = mb.addMenu(tr("menu_bookmarks"))
+        act(bkm, tr("menu_bm_page"),       "Ctrl+D",           self.toggle_bookmark)
+        act(bkm, tr("menu_bm_sidebar"),    "Ctrl+Shift+B",     self.toggle_sidebar)
 
         # Flash
-        flm = mb.addMenu("Flash")
-        self._ruffle_act = flm.addAction("Enable Ruffle Flash emulation")
+        flm = mb.addMenu(tr("menu_flash"))
+        self._ruffle_act = flm.addAction(tr("menu_ruffle"))
         self._ruffle_act.setCheckable(True)
-        self._ruffle_act.setChecked(self.settings.get("ruffle",True))
+        self._ruffle_act.setChecked(self.settings.get("ruffle", True))
         self._ruffle_act.triggered.connect(self._toggle_ruffle)
         flm.addSeparator()
-        act(flm,"Open SWF File…",      "Ctrl+Shift+F", self.open_swf)
+        act(flm, tr("menu_open_swf"),      "Ctrl+Shift+F",     self.open_swf)
 
         # Tools
-        tm = mb.addMenu("Tools")
-        act(tm,"Downloads",            "Ctrl+J",       self._dl_mgr.show)
-        act(tm,"Extensions",           "Ctrl+Shift+E", self.show_extensions)
-        act(tm,"Themes",               "",             self.show_themes)
-        act(tm,"User Scripts",         "",             self._open_user_scripts)
-        act(tm,"Tab Search",           "Ctrl+Shift+A", self.show_tab_search)
+        tm = mb.addMenu(tr("menu_tools"))
+        act(tm, tr("menu_downloads"),      "Ctrl+J",           self._dl_mgr.show)
+        act(tm, tr("menu_extensions"),     "Ctrl+Shift+E",     self.show_extensions)
+        act(tm, tr("menu_themes"),         "",                 self.show_themes)
+        act(tm, tr("menu_user_scripts"),   "",                 self._open_user_scripts)
+        act(tm, tr("menu_tab_search"),     "Ctrl+Shift+A",     self.show_tab_search)
         tm.addSeparator()
-        act(tm,"Settings",             "Ctrl+,",       self.show_settings)
+        act(tm, tr("menu_settings"),       "Ctrl+,",           self.show_settings)
         tm.addSeparator()
-        act(tm,"Developer Tools",      "F12",          self.open_devtools)
-        act(tm,"View Page Source",     "Ctrl+U",       self._view_source)
-        act(tm,"Page Info",            "Ctrl+I",       self.show_page_info)
+        act(tm, tr("menu_devtools"),       "F12",              self.open_devtools)
+        act(tm, tr("menu_view_source"),    "Ctrl+U",           self._view_source)
+        act(tm, tr("menu_page_info"),      "Ctrl+I",           self.show_page_info)
+
+        # Help
+        hpm = mb.addMenu(tr("menu_help"))
+        act(hpm, tr("menu_about"),         "F1",               self.show_about)
 
     def _build_shortcuts(self):
-        sc = QShortcut
-        # Navigation
-        sc(QKeySequence("Alt+Left"),   self).activated.connect(self.go_back)
-        sc(QKeySequence("Alt+Right"),  self).activated.connect(self.go_forward)
-        sc(QKeySequence("F5"),         self).activated.connect(self.reload)
-        sc(QKeySequence("Ctrl+R"),     self).activated.connect(self.reload)
-        sc(QKeySequence("Ctrl+Shift+R"),self).activated.connect(self._hard_reload)
-        sc(QKeySequence("Ctrl+L"),     self).activated.connect(self._focus_bar)
-        sc(QKeySequence("F6"),         self).activated.connect(self._focus_bar)
-        sc(QKeySequence("Alt+Home"),   self).activated.connect(self.go_home)
-        sc(QKeySequence("Escape"),     self).activated.connect(self.stop_load)
-        sc(QKeySequence("Ctrl+Enter"), self).activated.connect(self._nav_dotcom)
-        # Tabs
-        sc(QKeySequence("Ctrl+Tab"),        self).activated.connect(self._next_tab)
-        sc(QKeySequence("Ctrl+Shift+Tab"),  self).activated.connect(self._prev_tab)
-        sc(QKeySequence("Ctrl+Shift+T"),    self).activated.connect(self._restore_closed_tab)
-        for i in range(1,9):
-            sc(QKeySequence(f"Ctrl+{i}"),self).activated.connect(
-                lambda _,n=i-1: self.tabs.setCurrentIndex(n))
-        sc(QKeySequence("Ctrl+9"),self).activated.connect(
-            lambda: self.tabs.setCurrentIndex(self.tabs.count()-1))
-        # Zoom
-        sc(QKeySequence("Ctrl++"),self).activated.connect(
-            lambda: (t:=self._cur()) and t.zoom_in())
-        sc(QKeySequence("Ctrl+-"),self).activated.connect(
-            lambda: (t:=self._cur()) and t.zoom_out())
-        sc(QKeySequence("Ctrl+0"),self).activated.connect(
-            lambda: (t:=self._cur()) and t.zoom_reset())
-        # Other
-        sc(QKeySequence("Ctrl+Shift+A"),self).activated.connect(self.show_tab_search)
-        sc(QKeySequence("Ctrl+Shift+N"),self).activated.connect(self.open_private_window)
-        sc(QKeySequence("Ctrl+Shift+Delete"),self).activated.connect(self.show_clear_data)
+        def sc(key, slot, ctx=Qt.WindowShortcut):
+            s = QShortcut(QKeySequence(key), self)
+            s.setContext(ctx)
+            s.activated.connect(slot)
+            return s
+
+        # ── Escape: fullscreen → выход; иначе → остановить загрузку ─────────
+        sc("Escape", self._on_escape)
+
+        # ── Навигация ────────────────────────────────────────────────────────
+        sc("Alt+Left",        self.go_back,     Qt.ApplicationShortcut)
+        sc("Alt+Right",       self.go_forward,  Qt.ApplicationShortcut)
+        sc("Backspace",       self.go_back)          # как в Chrome
+        sc("F5",              self.reload)
+        sc("Ctrl+R",          self.reload)
+        sc("Ctrl+Shift+R",    self._hard_reload)
+        sc("Ctrl+L",          self._focus_bar,  Qt.ApplicationShortcut)
+        sc("F6",              self._focus_bar,  Qt.ApplicationShortcut)
+        sc("Alt+Home",        self.go_home)
+        sc("Ctrl+Enter",      self._nav_dotcom)
+
+        # ── Вкладки ──────────────────────────────────────────────────────────
+        sc("Ctrl+Tab",        self._next_tab,   Qt.ApplicationShortcut)
+        sc("Ctrl+Shift+Tab",  self._prev_tab,   Qt.ApplicationShortcut)
+        # Ctrl+Shift+T уже в меню — НЕ дублируем (избегаем ambiguous shortcut)
+        for i in range(1, 9):
+            sc(f"Ctrl+{i}", lambda _, n=i-1: self.tabs.setCurrentIndex(n))
+        sc("Ctrl+9", lambda: self.tabs.setCurrentIndex(self.tabs.count()-1))
+
+        # ── Зум (Ctrl+= для клавиатур без отдельного +) ─────────────────────
+        sc("Ctrl++",  lambda: (t := self._cur()) and t.zoom_in())
+        sc("Ctrl+=",  lambda: (t := self._cur()) and t.zoom_in())   # alias
+        sc("Ctrl+-",  lambda: (t := self._cur()) and t.zoom_out())
+        sc("Ctrl+0",  lambda: (t := self._cur()) and t.zoom_reset())
+
+        # ── Прочее ───────────────────────────────────────────────────────────
+        sc("Ctrl+Shift+A",      self.show_tab_search)
+        sc("Ctrl+Shift+N",      self.open_private_window)
+        sc("Ctrl+Shift+Delete", self.show_clear_data)
+        sc("F3",                lambda: (t := self._cur()) and t.find_bar.show_bar())
+        sc("Ctrl+F",            lambda: (t := self._cur()) and t.toggle_find(),
+           Qt.ApplicationShortcut)
 
     # ── Tab management ─────────────────────────────────────────────────────────
     def new_tab(self, url: str = None, private: bool = False) -> BrowserTab:
@@ -1216,15 +2195,16 @@ if(!_url.match({json.dumps(fnmatch.translate(s.get("pattern","*")))})) return;
         tab.load_progress.connect(self._prog.setValue)
         tab.load_finished.connect(lambda ok, _t=tab: self._on_done(_t,ok))
 
-        label = "🕵 Private" if (private or self._is_private_window) else "New Tab"
+        label = tr("tab_private") if (private or self._is_private_window) else tr("tab_new")
         idx = self.tabs.addTab(tab, label)
         self.tabs.setCurrentIndex(idx)
 
-        if url:
+        if url and url not in ("about:newtab", "about:blank"):
             tab.navigate(url)
         else:
-            theme = self.settings.get("theme","Catppuccin Mocha")
-            tab.load_new_tab(theme)
+            theme = self.settings.get("theme", "Catppuccin Mocha")
+            se    = self.settings.get("search_engine", DEFAULTS["search_engine"])
+            tab.load_new_tab(theme, se)
         return tab
 
     def close_tab(self, idx: int):
@@ -1232,7 +2212,7 @@ if(!_url.match({json.dumps(fnmatch.translate(s.get("pattern","*")))})) return;
         if isinstance(tab, BrowserTab):
             url = tab.view.url().toString()
             title = tab.view.title()
-            if url not in ("","about:newtab","about:blank"):
+            if url not in ("","about:newtab","about:blank") and not tab.private:
                 self._closed_tabs.append((url,title))
                 if len(self._closed_tabs) > 30: self._closed_tabs.pop(0)
         if self.tabs.count() <= 1: self.close(); return
@@ -1269,7 +2249,7 @@ if(!_url.match({json.dumps(fnmatch.translate(s.get("pattern","*")))})) return;
         short = (title[:22]+"…") if len(title)>25 else title
         pfx = "🕵 " if (tab.private or self._is_private_window) else ""
         self.tabs.setTabText(idx, pfx+short)
-        if tab is self._cur(): self.setWindowTitle(f"{title} — PyBrowser")
+        if tab is self._cur(): self.setWindowTitle(f"{title} — ES-Browser")
 
     def _set_icon(self, tab, icon):
         idx = self.tabs.indexOf(tab)
@@ -1312,8 +2292,23 @@ if(!_url.match({json.dumps(fnmatch.translate(s.get("pattern","*")))})) return;
     def _navigate_from_bar(self):
         text = self._url_bar.text().strip()
         if not text: return
+        url = resolve_url(text, self.settings["search_engine"])
         tab = self._cur()
-        if tab: tab.navigate(resolve_url(text, self.settings["search_engine"]))
+        if not tab: return
+        # Safe Browsing — базовая проверка подозрительных URL
+        if self.settings.get("safe_browsing", True):
+            for pat in SAFE_BROWSING_PATTERNS:
+                if re.search(pat, url, re.IGNORECASE):
+                    reply = QMessageBox.warning(
+                        self, tr("sb_title"),
+                        tr("sb_msg").format(url),
+                        QMessageBox.Ignore | QMessageBox.Abort,
+                        QMessageBox.Abort,
+                    )
+                    if reply == QMessageBox.Abort:
+                        return
+                    break
+        tab.navigate(url)
 
     def _reload_or_stop(self):
         if self._is_loading: self.stop_load()
@@ -1331,6 +2326,15 @@ if(!_url.match({json.dumps(fnmatch.translate(s.get("pattern","*")))})) return;
         if text and "." not in text:
             self._url_bar.setText("www."+text+".com")
         self._navigate_from_bar()
+
+    def _on_escape(self):
+        """Escape: выход из fullscreen → иначе закрыть find bar → иначе стоп."""
+        if self.isFullScreen():
+            self._exit_fullscreen(); return
+        t = self._cur()
+        if t and t.find_bar.isVisible():
+            t.find_bar.hide_bar(); return
+        self.stop_load()
 
     def go_back(self):
         if t := self._cur(): t.view.back()
@@ -1351,8 +2355,31 @@ if(!_url.match({json.dumps(fnmatch.translate(s.get("pattern","*")))})) return;
     def _focus_bar(self):
         self._url_bar.setFocus(); self._url_bar.selectAll()
 
+    def _enter_fullscreen(self):
+        """Полноэкранный режим: скрыть панели, развернуть окно."""
+        self._fs_had_toolbar = self._toolbar.isVisible()
+        self._fs_had_menu    = self.menuBar().isVisible()
+        self._toolbar.hide()
+        self.menuBar().hide()
+        self.tabs.tabBar().hide()
+        self.statusBar().hide()
+        self.showFullScreen()
+
+    def _exit_fullscreen(self):
+        """Выйти из полноэкранного режима, восстановить панели."""
+        self.showNormal()
+        if getattr(self, "_fs_had_toolbar", True):
+            self._toolbar.show()
+        if getattr(self, "_fs_had_menu", True):
+            self.menuBar().show()
+        self.tabs.tabBar().show()
+        self.statusBar().show()
+
     def toggle_fullscreen(self):
-        self.showNormal() if self.isFullScreen() else self.showFullScreen()
+        if self.isFullScreen():
+            self._exit_fullscreen()
+        else:
+            self._enter_fullscreen()
 
     # ── Bookmarks ──────────────────────────────────────────────────────────────
     def toggle_bookmark(self):
@@ -1362,12 +2389,12 @@ if(!_url.match({json.dumps(fnmatch.translate(s.get("pattern","*")))})) return;
         if any(b["url"]==url for b in self.bookmarks):
             self.bookmarks[:] = [b for b in self.bookmarks if b["url"]!=url]
             self._btn_star.setText("☆")
-            self.statusBar().showMessage("Bookmark removed",2000)
+            self.statusBar().showMessage(tr("st_bm_removed"),2000)
         else:
             self.bookmarks.append({"url":url,"title":title,
                 "date":datetime.now().strftime("%Y-%m-%d")})
             self._btn_star.setText("★")
-            self.statusBar().showMessage(f"Bookmarked: {title}",2000)
+            self.statusBar().showMessage(tr("st_bookmarked", title),2000)
         save_json(BOOKMARKS_F,self.bookmarks); self._sidebar.refresh()
 
     def _update_star(self, url):
@@ -1393,7 +2420,7 @@ if(!_url.match({json.dumps(fnmatch.translate(s.get("pattern","*")))})) return;
         dlg = ClearDataDialog(self.history, self)
         if dlg.exec_() == QDialog.Accepted:
             dlg.apply(self.profile)
-            self.statusBar().showMessage("Browsing data cleared",2000)
+            self.statusBar().showMessage(tr("st_data_cleared"),2000)
 
     # ── Sessions ───────────────────────────────────────────────────────────────
     def _save_session(self, name="last"):
@@ -1406,15 +2433,15 @@ if(!_url.match({json.dumps(fnmatch.translate(s.get("pattern","*")))})) return;
                     entries.append({"url":url,"title":tab.view.title()})
         self.sessions[name] = entries
         save_json(SESSIONS_F,self.sessions)
-        self.statusBar().showMessage(f"Session saved ({len(entries)} tabs)",2000)
+        self.statusBar().showMessage(tr("st_session_saved", len(entries)),2000)
 
     def _restore_session_dialog(self):
         names = [k for k in self.sessions if self.sessions[k]]
         if not names:
-            QMessageBox.information(self,"Sessions","No saved sessions found."); return
+            QMessageBox.information(self,tr("sess_title"),tr("sess_none")); return
         name, ok = QComboBox(), False
-        dlg = QDialog(self); dlg.setWindowTitle("Restore Session")
-        lay = QVBoxLayout(dlg); lay.addWidget(QLabel("Choose session:"))
+        dlg = QDialog(self); dlg.setWindowTitle(tr("sess_title"))
+        lay = QVBoxLayout(dlg); lay.addWidget(QLabel(tr("sess_choose")))
         cb = QComboBox()
         for n in names: cb.addItem(n)
         lay.addWidget(cb)
@@ -1450,7 +2477,7 @@ if(!_url.match({json.dumps(fnmatch.translate(s.get("pattern","*")))})) return;
         self._dark_menu_act.setChecked(new_val)
         self._apply_all_scripts()
         save_json(SETTINGS_F,self.settings)
-        msg = "Site dark mode ON — reload pages" if new_val else "Site dark mode OFF"
+        msg = tr("st_dark_on") if new_val else tr("st_dark_off")
         self.statusBar().showMessage(msg,2500)
 
     def _toggle_ruffle(self, checked):
@@ -1482,17 +2509,77 @@ if(!_url.match({json.dumps(fnmatch.translate(s.get("pattern","*")))})) return;
             if isinstance(tab,BrowserTab):
                 url = tab.view.url().toString()
                 if url in ("about:newtab","about:blank",""):
-                    tab.load_new_tab(name)
+                    se = self.settings.get("search_engine", DEFAULTS["search_engine"])
+                    tab.load_new_tab(name, se)
 
     # ── Settings ───────────────────────────────────────────────────────────────
     def show_settings(self):
         dlg = SettingsDialog(self.settings, self)
         if dlg.exec_() == QDialog.Accepted:
+            prev_dark = self.settings.get("dark_reader", False)
+            lang_changed = dlg.lang_changed()
             self.settings.update(dlg.result())
-            if self.settings.get("user_agent"):
-                self.profile.setHttpUserAgent(self.settings["user_agent"])
-            save_json(SETTINGS_F,self.settings)
-            self.statusBar().showMessage("Settings saved",2000)
+
+            # User-Agent
+            ua = self.settings.get("user_agent") or CHROME_UA
+            self.profile.setHttpUserAgent(ua)
+            self.private_profile.setHttpUserAgent(ua)
+
+            # JavaScript + pop-ups
+            for _prof in (self.profile, self.private_profile):
+                _ps = _prof.settings()
+                _ps.setAttribute(QWebEngineSettings.JavascriptEnabled,
+                                 self.settings.get("javascript", True))
+                _ps.setAttribute(QWebEngineSettings.JavascriptCanOpenWindows,
+                                 not self.settings.get("block_popups", True))
+                # Mixed content
+                _ps.setAttribute(QWebEngineSettings.AllowRunningInsecureContent,
+                                 not self.settings.get("block_mixed_content", True))
+
+            # Interceptor — DNT + Referrer
+            if self._interceptor:
+                self._interceptor.dnt             = self.settings.get("dnt", True)
+                self._interceptor.referrer_policy = self.settings.get("referrer_policy", "strict-origin")
+                self._interceptor.https_everywhere= self.settings.get("https_everywhere", False)
+                self._interceptor.ad_block        = self.settings.get("ad_block", True)
+
+            # Dark Reader — если изменился, перезаписываем скрипты
+            if self.settings.get("dark_reader") != prev_dark:
+                self._apply_all_scripts()
+                self._btn_dark.setChecked(self.settings.get("dark_reader", False))
+                self._dark_menu_act.setChecked(self.settings.get("dark_reader", False))
+
+            # Обновляем открытые вкладки «Новая вкладка» — чтобы поисковик применился сразу
+            se    = self.settings.get("search_engine", DEFAULTS["search_engine"])
+            theme = self.settings.get("theme", "Catppuccin Mocha")
+            for i in range(self.tabs.count()):
+                t = self.tabs.widget(i)
+                if isinstance(t, BrowserTab):
+                    u = t.view.url().toString()
+                    if u in ("about:newtab", "about:blank", ""):
+                        t.load_new_tab(theme, se)
+
+            # Применяем зум и JS/попапы ко всем уже открытым вкладкам
+            new_zoom = self.settings.get("zoom", 100) / 100
+            js_on    = self.settings.get("javascript", True)
+            pop_on   = not self.settings.get("block_popups", True)
+            for i in range(self.tabs.count()):
+                t = self.tabs.widget(i)
+                if isinstance(t, BrowserTab):
+                    t.view.setZoomFactor(new_zoom)
+                    t.view.settings().setAttribute(
+                        QWebEngineSettings.JavascriptEnabled, js_on)
+                    t.view.settings().setAttribute(
+                        QWebEngineSettings.JavascriptCanOpenWindows, pop_on)
+
+            save_json(SETTINGS_F, self.settings)
+            self.statusBar().showMessage(tr("st_settings_saved"), 2000)
+
+            # Language change — notify user that restart is needed
+            if lang_changed:
+                QMessageBox.information(
+                    self, tr("set_title"), tr("set_lang_restart")
+                )
 
     # ── Flash ──────────────────────────────────────────────────────────────────
     def open_swf(self):
@@ -1517,14 +2604,14 @@ if(!_url.match({json.dumps(fnmatch.translate(s.get("pattern","*")))})) return;
         if not tab: return
         dev = QWebEngineView()
         tab.view.page().setDevToolsPage(dev.page())
-        dlg = QDialog(self); dlg.setWindowTitle("Developer Tools"); dlg.resize(1100,660)
+        dlg = QDialog(self); dlg.setWindowTitle(tr("devtools_title")); dlg.resize(1100,660)
         lay = QVBoxLayout(dlg); lay.addWidget(dev); dlg.show()
 
     def _view_source(self):
         if t := self._cur(): t.view.page().toHtml(self._show_source_win)
 
     def _show_source_win(self, html):
-        dlg = QDialog(self); dlg.setWindowTitle("Page Source"); dlg.resize(920,660)
+        dlg = QDialog(self); dlg.setWindowTitle(tr("pagesrc_title")); dlg.resize(920,660)
         lay = QVBoxLayout(dlg)
         te = QTextEdit(); te.setReadOnly(True); te.setPlainText(html)
         te.setFont(QFont("Consolas",10)); lay.addWidget(te); dlg.show()
@@ -1535,11 +2622,12 @@ if(!_url.match({json.dumps(fnmatch.translate(s.get("pattern","*")))})) return;
         url  = tab.view.url().toString()
         title= tab.view.title()
         is_secure = url.startswith("https://")
+        conn = tr("pi_secure") if is_secure else tr("pi_insecure")
         msg = (f"<b>Title:</b> {title}<br>"
                f"<b>URL:</b> {url}<br>"
-               f"<b>Connection:</b> {'🔒 Secure (HTTPS)' if is_secure else '⚠ Not secure (HTTP)'}<br>"
+               f"<b>Connection:</b> {conn}<br>"
                f"<b>Zoom:</b> {int(tab.view.zoomFactor()*100)}%")
-        QMessageBox.information(self,"Page Info",msg)
+        QMessageBox.information(self, tr("pi_title"), msg)
 
     def show_tab_search(self):
         dlg = TabSearchDialog(self.tabs, self)
@@ -1547,6 +2635,10 @@ if(!_url.match({json.dumps(fnmatch.translate(s.get("pattern","*")))})) return;
         # Center over window
         pos = self.frameGeometry().center() - dlg.rect().center()
         dlg.move(pos); dlg.exec_()
+
+    def show_about(self):
+        dlg = AboutDialog(self)
+        dlg.exec_()
 
     # ── Persistence ────────────────────────────────────────────────────────────
     def closeEvent(self, event):
@@ -1560,13 +2652,35 @@ if(!_url.match({json.dumps(fnmatch.translate(s.get("pattern","*")))})) return;
 
 # ── Entry Point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS",
-        "--enable-gpu-rasterization --enable-zero-copy")
+    # ── Должны быть ДО QApplication ──────────────────────────────────────────
+    # Отключаем sandbox — на Windows часто мешает JS
+    os.environ["QTWEBENGINE_DISABLE_SANDBOX"] = "1"
+    # Флаги Chromium: включаем NetworkService (нужен для YouTube)
+    os.environ.setdefault(
+        "QTWEBENGINE_CHROMIUM_FLAGS",
+        # Сеть
+        "--enable-features=NetworkService,NetworkServiceInProcess"
+        # Рендеринг
+        " --force-color-profile=srgb"
+        " --enable-gpu-rasterization"
+        " --enable-accelerated-2d-canvas"
+        " --ignore-gpu-blocklist"
+        " --ignore-gpu-driver-bug-workarounds"
+        # Убрать флаг автоматизации (нужен для Google Login)
+        " --disable-blink-features=AutomationControlled"
+        # Медиа: autoplay без жеста, Media Foundation для видео на Windows
+        " --autoplay-policy=no-user-gesture-required"
+        " --enable-features=MediaFoundationVideoCapture"
+    )
 
     app = QApplication(sys.argv)
-    app.setApplicationName("PyBrowser")
+    app.setApplicationName("ES-Browser")
     app.setStyle("Fusion")
     f = app.font(); f.setFamily("Segoe UI"); f.setPointSize(10); app.setFont(f)
+
+    # Глобальный фильтр доп. кнопок мыши (назад/вперёд)
+    _mouse_filter = _NavMouseFilter()
+    app.installEventFilter(_mouse_filter)
 
     win = MainWindow()
     win.resize(1300, 840)
